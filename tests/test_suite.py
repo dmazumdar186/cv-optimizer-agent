@@ -1,9 +1,13 @@
 """
 Test suite for cv_optimizer_agent.py
-Covers: null safety, slugify, PDF generation, page count accuracy, French Unicode labels
+Covers: null safety, slugify, PDF generation (bytes), BytesIO extraction, French Unicode labels
 Run from repo root: py tests/test_suite.py
 """
-import importlib.util, pathlib, re, sys
+import importlib.util
+import io
+import pathlib
+import re
+import sys
 
 spec = importlib.util.spec_from_file_location(
     'cv_opt',
@@ -93,25 +97,28 @@ try:
 except Exception as e:
     fail('T3', e)
 
-# ── T4: CV PDF with all-null optional fields ───────────────────────────────────
+# ── T4: CV PDF returns bytes ───────────────────────────────────────────────────
 try:
+    result = mod.build_cv_pdf(opt_cv, labels, target_pages=1)
+    assert isinstance(result, bytes), f'Expected bytes, got {type(result)}'
+    assert len(result) > 5000, f'PDF too small: {len(result)} bytes'
     out = TMP / 'test_t4_null_cv.pdf'
-    pages = mod.build_cv_pdf(opt_cv, labels, out, target_pages=1)
-    assert out.exists() and out.stat().st_size > 5000
-    ok(f'T4: CV PDF with null fields — {pages}p, {out.stat().st_size // 1024}KB')
+    out.write_bytes(result)
+    ok(f'T4: build_cv_pdf returns bytes — {len(result) // 1024}KB')
 except Exception as e:
     fail('T4', e)
 
-# ── T5: CV PDF page-count targeting ───────────────────────────────────────────
+# ── T5: CV PDF page-count targeting returns bytes ─────────────────────────────
 try:
+    result = mod.build_cv_pdf(opt_cv, labels, target_pages=2)
+    assert isinstance(result, bytes), f'Expected bytes, got {type(result)}'
     out = TMP / 'test_t5_2page.pdf'
-    pages = mod.build_cv_pdf(opt_cv, labels, out, target_pages=2)
-    assert 1 <= pages <= 3
-    ok(f'T5: CV PDF page-count targeting — {pages}p for 2p target')
+    out.write_bytes(result)
+    ok(f'T5: build_cv_pdf 2-page target — {len(result) // 1024}KB')
 except Exception as e:
     fail('T5', e)
 
-# ── T6: Cover letter PDF returns actual page count ─────────────────────────────
+# ── T6: Cover letter PDF returns bytes ────────────────────────────────────────
 try:
     cover = (
         'Paris, April 10 2026\n\n'
@@ -122,21 +129,24 @@ try:
         'I bring both technical depth and business fluency.\n\n'
         'Sincerely,\nJane Smith'
     )
+    result = mod.build_cover_letter_pdf(cover, opt_cv)
+    assert isinstance(result, bytes), f'Expected bytes, got {type(result)}'
+    assert len(result) > 3000, f'PDF too small: {len(result)} bytes'
     out = TMP / 'test_t6_cl.pdf'
-    cl_pages = mod.build_cover_letter_pdf(cover, opt_cv, out)
-    assert isinstance(cl_pages, int) and cl_pages >= 1
-    assert out.exists() and out.stat().st_size > 3000
-    ok(f'T6: Cover letter PDF — {cl_pages}p, {out.stat().st_size // 1024}KB')
+    out.write_bytes(result)
+    ok(f'T6: build_cover_letter_pdf returns bytes — {len(result) // 1024}KB')
 except Exception as e:
     fail('T6', e)
 
-# ── T7: Cover letter response parser handles non-text blocks ──────────────────
+# ── T7: extract_cv_pdf accepts BytesIO ────────────────────────────────────────
 try:
-    class FakeBlock:
-        type = 'tool_use'  # no .text attribute
-    blocks = [b for b in [FakeBlock()] if hasattr(b, 'text')]
-    assert blocks == []
-    ok('T7: Cover letter response parser handles non-text blocks')
+    # Build a minimal PDF in memory using reportlab, then extract text from BytesIO
+    cv_pdf_bytes = mod.build_cv_pdf(opt_cv, labels, target_pages=1)
+    bio = io.BytesIO(cv_pdf_bytes)
+    text, pages = mod.extract_cv_pdf(bio)
+    assert isinstance(text, str), f'Expected str, got {type(text)}'
+    assert isinstance(pages, int) and pages >= 1, f'Expected page count >= 1, got {pages}'
+    ok(f'T7: extract_cv_pdf accepts BytesIO — {pages}p, {len(text)} chars')
 except Exception as e:
     fail('T7', e)
 
@@ -148,9 +158,11 @@ try:
         'experience': [], 'skills': [], 'education': [],
         'languages': [], 'certifications': [], 'projects': [],
     }
+    result = mod.build_cv_pdf(sparse, labels, target_pages=1)
+    assert isinstance(result, bytes) and len(result) > 0
     out = TMP / 'test_t8_sparse.pdf'
-    pages = mod.build_cv_pdf(sparse, labels, out, target_pages=1)
-    ok(f'T8: Sparse/empty CV sections — {pages}p')
+    out.write_bytes(result)
+    ok(f'T8: Sparse/empty CV sections — {len(result) // 1024}KB')
 except Exception as e:
     fail('T8', e)
 
@@ -164,13 +176,15 @@ try:
         'certifications': 'Certifications',
         'projects': 'Projets Personnels',
     }
+    result = mod.build_cv_pdf(opt_cv, fr_labels, target_pages=1)
+    assert isinstance(result, bytes) and len(result) > 5000
     out = TMP / 'test_t9_french.pdf'
-    pages = mod.build_cv_pdf(opt_cv, fr_labels, out, target_pages=1)
-    ok(f'T9: French Unicode labels — {pages}p, {out.stat().st_size // 1024}KB')
+    out.write_bytes(result)
+    ok(f'T9: French Unicode labels — {len(result) // 1024}KB')
 except Exception as e:
     fail('T9', e)
 
-# ── T10: Long cover letter triggers page overflow warning ─────────────────────
+# ── T10: Long cover letter does not crash ─────────────────────────────────────
 try:
     long_cover = '\n\n'.join([
         'Paris, April 10 2026',
@@ -180,18 +194,18 @@ try:
         'It contains substantial narrative content designed to test overflow detection. ' * 4
         for i in range(1, 20)
     ] + ['Sincerely,\nJane Smith'])
+    result = mod.build_cover_letter_pdf(long_cover, opt_cv)
+    assert isinstance(result, bytes) and len(result) > 0
     out = TMP / 'test_t10_overflow.pdf'
-    cl_pages = mod.build_cover_letter_pdf(long_cover, opt_cv, out)
-    assert isinstance(cl_pages, int) and cl_pages >= 1
-    note = ' (OVERFLOW DETECTED - cover letter too long)' if cl_pages > 1 else ''
-    ok(f'T10: Long cover letter overflow handling — {cl_pages}p{note}')
+    out.write_bytes(result)
+    ok(f'T10: Long cover letter overflow handling — {len(result) // 1024}KB')
 except Exception as e:
     fail('T10', e)
 
-# ── T11: JD too short — error message fires ───────────────────────────────────
+# ── T11: JD minimum length guard logic ────────────────────────────────────────
 try:
     jd = 'Short JD'
-    triggered = len(jd) < 50
+    triggered = len(jd.strip()) < 50
     assert triggered
     ok('T11: JD minimum length guard logic correct')
 except Exception as e:

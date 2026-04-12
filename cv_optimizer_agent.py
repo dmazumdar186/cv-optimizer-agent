@@ -1,75 +1,42 @@
 #!/usr/bin/env python3
 """
 cv_optimizer_agent.py
-description: Interactive CV optimizer — scores any CV against a job description,
-             generates an optimized ATS-ready CV PDF and a matching cover letter PDF
-             in the language of the job description.
-inputs: interactive prompts (JD text/path, CV PDF path, company name)
-outputs: .tmp/cv_opt_{company}_{lastname}.pdf, .tmp/cover_letter_{company}_{lastname}.pdf
-
-Usage:
-    py cv_optimizer_agent.py
-
-Dependencies:
-    pip install reportlab pdfplumber anthropic python-dotenv
+Engine module: PDF generation, text extraction, and Gemini AI analysis.
+Imported by app.py (Streamlit) — no CLI entry point.
 """
 
 import io
+import json
 import os
 import re
-import sys
-import textwrap
 from datetime import date
 from pathlib import Path
 
-# ── Dependency checks ──────────────────────────────────────────────────────────
-def _require(pkg, install_name=None):
-    import importlib
-    try:
-        return importlib.import_module(pkg)
-    except ImportError:
-        name = install_name or pkg
-        print(f"ERROR: missing dependency — run:  pip install {name}")
-        sys.exit(1)
+import pdfplumber
+from google import genai
+from google.genai import types as genai_types
 
-pdfplumber  = _require('pdfplumber')
-anthropic   = _require('anthropic')
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import ParagraphStyle
+from reportlab.lib.units import cm
+from reportlab.lib.colors import HexColor
+from reportlab.platypus import (
+    BaseDocTemplate, PageTemplate, Frame,
+    Paragraph, Spacer, Table, TableStyle,
+    Flowable, KeepTogether, HRFlowable,
+)
+from reportlab.lib.enums import TA_JUSTIFY
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.pdfbase.pdfmetrics import registerFontFamily
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv(Path(__file__).resolve().parent / '.env')
-except ImportError:
-    pass  # dotenv optional; user can export ANTHROPIC_API_KEY manually
-
-try:
-    from reportlab.lib.pagesizes import A4
-    from reportlab.lib.styles import ParagraphStyle
-    from reportlab.lib.units import cm
-    from reportlab.lib.colors import HexColor
-    from reportlab.platypus import (
-        BaseDocTemplate, PageTemplate, Frame,
-        Paragraph, Spacer, Table, TableStyle,
-        Flowable, KeepTogether, HRFlowable,
-    )
-    from reportlab.lib.enums import TA_JUSTIFY
-    from reportlab.pdfbase import pdfmetrics
-    from reportlab.pdfbase.ttfonts import TTFont
-    from reportlab.pdfbase.pdfmetrics import registerFontFamily
-except ImportError:
-    print("ERROR: pip install reportlab")
-    sys.exit(1)
-
-# ── Paths ──────────────────────────────────────────────────────────────────────
-ROOT = Path(__file__).resolve().parent
-TMP  = ROOT / '.tmp'
-
-# ── Page geometry ──────────────────────────────────────────────────────────────
+# ── Page geometry ───────────────────────────────────────────────────────────────
 PAGE_W, PAGE_H = A4
 MARGIN_LR = 1.8 * cm
 MARGIN_TB = 1.5 * cm
 TEXT_W    = PAGE_W - 2 * MARGIN_LR
 
-# ── Colours ────────────────────────────────────────────────────────────────────
+# ── Colours ─────────────────────────────────────────────────────────────────────
 NAVY   = HexColor('#1A1A2E')
 TEAL   = HexColor('#1B9AAA')
 DKGRY  = HexColor('#2C2C2C')
@@ -77,9 +44,9 @@ MDGRY  = HexColor('#666666')
 LTBLUE = HexColor('#EAF4F7')
 
 
-# ── Font registration ──────────────────────────────────────────────────────────
+# ── Font registration ───────────────────────────────────────────────────────────
 def _register_fonts():
-    """Use Arial (Windows) for full Unicode; fall back to Helvetica."""
+    """Use Arial (Windows) for full Unicode; fall back to Helvetica on Linux."""
     win_fonts = os.path.join(os.environ.get('WINDIR', 'C:/Windows'), 'Fonts')
     regular   = os.path.join(win_fonts, 'arial.ttf')
     bold      = os.path.join(win_fonts, 'arialbd.ttf')
@@ -211,7 +178,7 @@ def make_skill_row(cat, val, S):
 def _slugify(s: str) -> str:
     """Convert a string to a safe filename slug (Windows-compatible)."""
     s = (s or '').strip().lower()
-    s = re.sub(r'[\\/:*?"<>|]', '', s)   # strip Windows-illegal chars
+    s = re.sub(r'[\\/:*?"<>|]', '', s)
     s = re.sub(r'\s+', '_', s)
     return (s or 'unknown')[:80]
 
@@ -232,7 +199,7 @@ def format_contact_line(contact: dict) -> str:
     return sep.join(parts)
 
 
-# ── Claude system prompts ───────────────────────────────────────────────────────
+# ── System prompts ──────────────────────────────────────────────────────────────
 CV_ADVISOR_SYSTEM = """
 You are the world's most intelligent and experienced CV Advisor, combining the precision of an
 advanced ATS system with the strategic insight of an expert human recruiter.
@@ -258,6 +225,10 @@ Your task is to:
 
 The first 2 seconds of human recruiter review must convey clear, high value for this role.
 Every bullet point should demonstrate measurable impact.
+
+Be HYPERCRITICAL in your scoring. Most CVs score 4–6 initially. A score of 8 or above
+requires exceptional keyword match, quantified achievements, and role-specific language.
+Do not inflate scores.
 """.strip()
 
 COVER_LETTER_SYSTEM = """
@@ -281,227 +252,138 @@ Rules:
 """.strip()
 
 
-# ── Tool schema for structured Claude output ────────────────────────────────────
-ANALYSIS_TOOL = {
-    "name": "cv_analysis_result",
-    "description": "Structured CV analysis and optimisation output",
-    "input_schema": {
-        "type": "object",
-        "required": [
-            "language", "ats_score_initial", "ats_score_improved",
-            "skill_matrix", "recommendations", "section_labels", "optimized_cv"
-        ],
-        "properties": {
-            "language": {
-                "type": "string",
-                "description": "Language of the job description (e.g. 'French', 'English')"
-            },
-            "ats_score_initial": {
-                "type": "integer",
-                "description": "Initial ATS keyword match score out of 10"
-            },
-            "ats_score_improved": {
-                "type": "integer",
-                "description": "Projected ATS score after applying recommendations, out of 10"
-            },
-            "skill_matrix": {
-                "type": "array",
-                "items": {
+# ── JSON schema for structured Gemini output ────────────────────────────────────
+CV_ANALYSIS_SCHEMA = {
+    "type": "object",
+    "required": [
+        "language", "ats_score_initial", "ats_score_improved",
+        "skill_matrix", "recommendations", "section_labels", "optimized_cv"
+    ],
+    "properties": {
+        "language": {
+            "type": "string",
+            "description": "Language of the job description (e.g. 'French', 'English')"
+        },
+        "ats_score_initial": {
+            "type": "integer",
+            "description": "Initial ATS keyword match score out of 10"
+        },
+        "ats_score_improved": {
+            "type": "integer",
+            "description": "Projected ATS score after applying recommendations, out of 10"
+        },
+        "skill_matrix": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": [
+                    "skill", "present_in_cv", "transferable",
+                    "transferable_skill", "strategic_score", "score_reason"
+                ],
+                "properties": {
+                    "skill":              {"type": "string"},
+                    "present_in_cv":      {"type": "boolean"},
+                    "transferable":       {"type": "boolean"},
+                    "transferable_skill": {"type": "string"},
+                    "strategic_score":    {"type": "integer"},
+                    "score_reason":       {"type": "string"}
+                }
+            }
+        },
+        "recommendations": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Top actionable recommendations to reach 9+/10 ATS score"
+        },
+        "section_labels": {
+            "type": "object",
+            "required": [
+                "experience", "skills", "education",
+                "languages", "certifications", "projects"
+            ],
+            "properties": {
+                "experience":     {"type": "string"},
+                "skills":         {"type": "string"},
+                "education":      {"type": "string"},
+                "languages":      {"type": "string"},
+                "certifications": {"type": "string"},
+                "projects":       {"type": "string"}
+            }
+        },
+        "optimized_cv": {
+            "type": "object",
+            "required": [
+                "name", "title", "contact", "summary", "summary_kpis",
+                "experience", "skills", "education", "languages",
+                "certifications", "projects"
+            ],
+            "properties": {
+                "name":  {"type": "string"},
+                "title": {"type": "string"},
+                "contact": {
                     "type": "object",
-                    "required": [
-                        "skill", "present_in_cv", "transferable",
-                        "transferable_skill", "strategic_score", "score_reason"
-                    ],
                     "properties": {
-                        "skill":              {"type": "string"},
-                        "present_in_cv":      {"type": "boolean"},
-                        "transferable":       {"type": "boolean"},
-                        "transferable_skill": {"type": "string",
-                                               "description": "Name of transferable skill, or 'N/A'"},
-                        "strategic_score":    {"type": "integer",
-                                               "description": "Relevance score 1-10 for this role"},
-                        "score_reason":       {"type": "string"}
+                        "email":    {"type": "string"},
+                        "phone":    {"type": "string"},
+                        "location": {"type": "string"},
+                        "linkedin": {"type": "string"},
+                        "github":   {"type": "string"}
                     }
-                }
-            },
-            "recommendations": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "Top actionable recommendations to reach 9+/10 ATS score"
-            },
-            "section_labels": {
-                "type": "object",
-                "description": "Section header names in the JD's language",
-                "required": [
-                    "experience", "skills", "education",
-                    "languages", "certifications", "projects"
-                ],
-                "properties": {
-                    "experience":     {"type": "string"},
-                    "skills":         {"type": "string"},
-                    "education":      {"type": "string"},
-                    "languages":      {"type": "string"},
-                    "certifications": {"type": "string"},
-                    "projects":       {"type": "string"}
-                }
-            },
-            "optimized_cv": {
-                "type": "object",
-                "required": [
-                    "name", "title", "contact", "summary", "summary_kpis",
-                    "experience", "skills", "education", "languages",
-                    "certifications", "projects"
-                ],
-                "properties": {
-                    "name":  {"type": "string"},
-                    "title": {
-                        "type": "string",
-                        "description": "Professional headline, in the JD's language"
-                    },
-                    "contact": {
+                },
+                "summary":      {"type": "string"},
+                "summary_kpis": {"type": "string"},
+                "experience": {
+                    "type": "array",
+                    "items": {
                         "type": "object",
+                        "required": ["role", "company_line", "bullets", "is_oneliner"],
                         "properties": {
-                            "email":    {"type": "string"},
-                            "phone":    {"type": "string"},
-                            "location": {"type": "string"},
-                            "linkedin": {"type": "string"},
-                            "github":   {"type": "string"}
+                            "role":         {"type": "string"},
+                            "company_line": {"type": "string"},
+                            "bullets":      {"type": "array", "items": {"type": "string"}},
+                            "is_oneliner":  {"type": "boolean"}
                         }
-                    },
-                    "summary": {
-                        "type": "string",
-                        "description": "2-3 sentence ATS-optimised professional summary in JD's language"
-                    },
-                    "summary_kpis": {
-                        "type": "string",
-                        "description": "One-line key metrics/KPIs (bold-tagged with <b></b> for impact figures)"
-                    },
-                    "experience": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "required": ["role", "company_line", "bullets", "is_oneliner"],
-                            "properties": {
-                                "role":         {"type": "string"},
-                                "company_line": {
-                                    "type": "string",
-                                    "description": "e.g. 'Wiser Solutions, Paris | Nov 2022 – Present'"
-                                },
-                                "bullets": {
-                                    "type": "array",
-                                    "items": {"type": "string"},
-                                    "description": "Impact-first bullets; use <b></b> for key metrics"
-                                },
-                                "is_oneliner": {
-                                    "type": "boolean",
-                                    "description": "True for brief/older roles rendered as a single line"
-                                }
-                            }
-                        }
-                    },
-                    "skills": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "required": ["category", "value"],
-                            "properties": {
-                                "category": {"type": "string"},
-                                "value":    {"type": "string"}
-                            }
-                        }
-                    },
-                    "education": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "required": ["degree", "institution_line"],
-                            "properties": {
-                                "degree":           {"type": "string"},
-                                "institution_line": {"type": "string"}
-                            }
-                        }
-                    },
-                    "languages": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "e.g. ['English: Bilingual', 'French: Native']"
-                    },
-                    "certifications": {
-                        "type": "array",
-                        "items": {"type": "string"}
-                    },
-                    "projects": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Use <a href='...' color='#1B9AAA'>text</a> for clickable project links"
                     }
-                }
+                },
+                "skills": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["category", "value"],
+                        "properties": {
+                            "category": {"type": "string"},
+                            "value":    {"type": "string"}
+                        }
+                    }
+                },
+                "education": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["degree", "institution_line"],
+                        "properties": {
+                            "degree":           {"type": "string"},
+                            "institution_line": {"type": "string"}
+                        }
+                    }
+                },
+                "languages":      {"type": "array", "items": {"type": "string"}},
+                "certifications": {"type": "array", "items": {"type": "string"}},
+                "projects":       {"type": "array", "items": {"type": "string"}}
             }
         }
     }
 }
 
 
-# ── Interactive input gathering ─────────────────────────────────────────────────
-def gather_inputs():
-    """Interactively collect JD text, CV path, and company name from the user."""
-    print()
-    print('CV Optimizer Agent')
-    print('══════════════════')
-    print()
-
-    # --- Job Description ---
-    print('Step 1 of 3 — Job Description')
-    print('  Enter a file path to a .txt file, OR paste the JD text directly.')
-    print('  If pasting: type/paste your text, then press Enter twice to finish.\n')
-    jd_input = input('  JD (path or first line): ').strip()
-
-    if os.path.isfile(jd_input):
-        jd_text = Path(jd_input).read_text(encoding='utf-8').strip()
-        print(f'  Loaded from file: {len(jd_text):,} chars')
-    else:
-        # Multi-line paste: user already typed first line
-        lines = [jd_input]
-        print('  (Continue pasting — press Enter twice when done)')
-        while True:
-            line = input()
-            if line == '' and lines and lines[-1] == '':
-                break
-            lines.append(line)
-        jd_text = '\n'.join(lines).strip()
-        if not jd_text or len(jd_text) < 50:
-            print(f'ERROR: Job description too short ({len(jd_text)} chars). '
-                  'Did you press Enter twice too early? Please re-run and paste the full JD.')
-            sys.exit(1)
-        print(f'  JD captured: {len(jd_text):,} chars')
-
-    # --- CV PDF ---
-    print()
-    print('Step 2 of 3 — CV PDF')
-    cv_path_str = input('  Path to your CV PDF: ').strip().strip('"').strip("'")
-    cv_path = Path(cv_path_str)
-    if not cv_path.exists():
-        print(f'ERROR: File not found: {cv_path}')
-        sys.exit(1)
-    if cv_path.suffix.lower() != '.pdf':
-        print('ERROR: Please provide a PDF file.')
-        sys.exit(1)
-
-    # --- Company ---
-    print()
-    print('Step 3 of 3 — Company name (used in output filename)')
-    company = input('  Company name: ').strip()
-    if not company:
-        company = 'company'
-
-    print()
-    return jd_text, cv_path, company
-
-
 # ── PDF text extraction ─────────────────────────────────────────────────────────
-def extract_cv_pdf(cv_path: Path) -> tuple[str, int]:
-    """Extract text and page count from a CV PDF. Returns (text, page_count)."""
-    with pdfplumber.open(cv_path) as pdf:
+def extract_cv_pdf(cv_source) -> tuple[str, int]:
+    """Extract text and page count from a CV PDF.
+
+    cv_source: Path or BytesIO.
+    Returns (text, page_count).
+    """
+    with pdfplumber.open(cv_source) as pdf:
         page_count = len(pdf.pages)
         pages_text = []
         for page in pdf.pages:
@@ -512,47 +394,41 @@ def extract_cv_pdf(cv_path: Path) -> tuple[str, int]:
     return full_text, page_count
 
 
-# ── Claude API: Analysis + Optimised CV ─────────────────────────────────────────
-def run_analysis(cv_text: str, jd_text: str, client) -> dict:
-    """Call Claude to analyse the CV against the JD and return structured JSON."""
+# ── Gemini: CV Analysis ─────────────────────────────────────────────────────────
+def run_analysis(cv_text: str, jd_text: str, api_key: str) -> dict:
+    """Call Gemini to analyse the CV against the JD. Returns structured dict."""
+    client = genai.Client(api_key=api_key)
+    schema_hint = json.dumps(CV_ANALYSIS_SCHEMA, ensure_ascii=False)
     user_msg = (
         f"<cv>\n{cv_text}\n</cv>\n\n"
         f"<job_description>\n{jd_text}\n</job_description>\n\n"
         "Analyse this CV against the job description. Follow all instructions in your "
-        "system prompt. Call the cv_analysis_result tool with your complete structured output."
+        f"system prompt. Return a JSON object exactly matching this schema:\n{schema_hint}"
     )
-
-    response = client.messages.create(
-        model='claude-opus-4-6',
-        max_tokens=16000,
-        system=CV_ADVISOR_SYSTEM,
-        tools=[ANALYSIS_TOOL],
-        tool_choice={"type": "tool", "name": "cv_analysis_result"},
-        messages=[{"role": "user", "content": user_msg}],
+    response = client.models.generate_content(
+        model="gemini-2.0-flash",
+        contents=user_msg,
+        config=genai_types.GenerateContentConfig(
+            system_instruction=CV_ADVISOR_SYSTEM,
+            response_mime_type="application/json",
+        ),
     )
-
-    if response.stop_reason == 'max_tokens':
-        raise RuntimeError(
-            "Claude response was truncated (max_tokens hit). "
-            "Try shortening the CV or contact the maintainer to increase the limit."
-        )
-
-    # Extract tool result
-    for block in response.content:
-        if block.type == 'tool_use' and block.name == 'cv_analysis_result':
-            return block.input
-
-    raise RuntimeError("Claude did not return the expected tool call output.")
+    raw = response.text.strip()
+    # Strip markdown code fences if present
+    if raw.startswith("```"):
+        raw = re.sub(r'^```[a-z]*\n?', '', raw)
+        raw = re.sub(r'\n?```$', '', raw.strip())
+    return json.loads(raw)
 
 
-# ── Claude API: Cover Letter ────────────────────────────────────────────────────
+# ── Gemini: Cover Letter ────────────────────────────────────────────────────────
 def run_cover_letter(cv_text: str, jd_text: str, language: str,
-                     optimized_cv: dict, company: str, client) -> str:
-    """Call Claude to generate a cover letter. Returns plain text."""
+                     optimized_cv: dict, company: str, api_key: str) -> str:
+    """Call Gemini to generate a cover letter. Returns plain text."""
+    client = genai.Client(api_key=api_key)
     summary = optimized_cv.get('summary', '')
     name    = optimized_cv.get('name', '')
     title   = optimized_cv.get('title', '')
-
     user_msg = (
         f"Write the cover letter in: {language}\n\n"
         f"Candidate: {name} — {title}\n\n"
@@ -561,83 +437,20 @@ def run_cover_letter(cv_text: str, jd_text: str, language: str,
         f"<job_description>\n{jd_text}\n</job_description>\n\n"
         f"Company applying to: {company}\n"
         f"Today's date: {date.today().strftime('%d %B %Y')}\n\n"
-        "Generate a submission-ready cover letter following all 15 steps in your system prompt. "
+        "Generate a submission-ready cover letter following all instructions in your system prompt. "
         "Return only the final cover letter text — no commentary, no step-by-step notes."
     )
-
-    response = client.messages.create(
-        model='claude-opus-4-6',
-        max_tokens=2048,
-        system=COVER_LETTER_SYSTEM,
-        messages=[{"role": "user", "content": user_msg}],
+    response = client.models.generate_content(
+        model="gemini-2.0-flash",
+        contents=user_msg,
+        config=genai_types.GenerateContentConfig(
+            system_instruction=COVER_LETTER_SYSTEM,
+        ),
     )
-
-    text_blocks = [b for b in response.content if hasattr(b, 'text')]
-    if not text_blocks:
-        raise RuntimeError("Cover letter API call returned no text content.")
-    return text_blocks[0].text.strip()
+    return response.text.strip()
 
 
-# ── Console report ──────────────────────────────────────────────────────────────
-def print_report(analysis: dict, cv_filename: str, page_count: int, cv_chars: int):
-    """Print the ATS analysis report to stdout."""
-    lang   = analysis.get('language', 'Unknown')
-    score0 = analysis.get('ats_score_initial', '?')
-    score1 = analysis.get('ats_score_improved', '?')
-    matrix = analysis.get('skill_matrix', [])
-    recs   = analysis.get('recommendations', [])
-
-    print()
-    print(f'  CV loaded : {cv_filename}  ({page_count} page{"s" if page_count > 1 else ""}, '
-          f'{cv_chars:,} chars extracted)')
-    print()
-    print('  Analysis complete.')
-    print()
-    print('  \u250c' + '\u2500' * 43 + '\u2510')
-    print(f'  \u2502  Initial ATS Score   : {str(score0) + " / 10":<30}\u2502')
-    print(f'  \u2502  Optimised ATS Score : {str(score1) + " / 10":<30}\u2502')
-    print(f'  \u2502  JD Language         : {lang:<30}\u2502')
-    print('  \u2514' + '\u2500' * 43 + '\u2518')
-    print()
-
-    if matrix:
-        # Truncate to top 10 by strategic_score for readability
-        sorted_matrix = sorted(matrix, key=lambda x: x.get('strategic_score', 0), reverse=True)
-        shown = sorted_matrix[:10]
-        print('  Skill Matrix (top skills by strategic relevance):')
-        print('  ' + '\u250c' + '\u2500' * 28 + '\u252c' + '\u2500' * 10 + '\u252c' +
-              '\u2500' * 13 + '\u252c' + '\u2500' * 7 + '\u2510')
-        print('  \u2502' + ' Skill'.ljust(28) + '\u2502' + ' Present'.ljust(10) +
-              '\u2502' + ' Transferable'.ljust(13) + '\u2502 Score \u2502')
-        print('  ' + '\u251c' + '\u2500' * 28 + '\u253c' + '\u2500' * 10 + '\u253c' +
-              '\u2500' * 13 + '\u253c' + '\u2500' * 7 + '\u2524')
-        for row in shown:
-            skill  = row.get('skill', '')[:26].ljust(26)
-            pres   = ('Yes' if row.get('present_in_cv') else 'No').ljust(8)
-            trans  = ('Yes' if row.get('transferable') else 'No').ljust(11)
-            score  = str(row.get('strategic_score', '?')) + '/10'
-            print(f'  \u2502 {skill} \u2502 {pres} \u2502 {trans} \u2502 {score:<5} \u2502')
-        print('  ' + '\u2514' + '\u2500' * 28 + '\u2534' + '\u2500' * 10 + '\u2534' +
-              '\u2500' * 13 + '\u2534' + '\u2500' * 7 + '\u2518')
-        if len(matrix) > 10:
-            print(f'  (+ {len(matrix) - 10} more skills analysed)')
-        print()
-
-    if recs:
-        print('  Key Recommendations:')
-        for r in recs[:6]:
-            wrapped = textwrap.wrap(r, width=72)
-            if not wrapped:
-                continue
-            print(f'    \u2022 {wrapped[0]}')
-            for line in wrapped[1:]:
-                print(f'      {line}')
-        if len(recs) > 6:
-            print(f'    ... and {len(recs) - 6} more.')
-        print()
-
-
-# ── CV PDF builder ──────────────────────────────────────────────────────────────
+# ── CV story builder ────────────────────────────────────────────────────────────
 def build_cv_story(opt_cv: dict, labels: dict, S: dict) -> list:
     """Build the ReportLab story (flowables) from the optimised CV dict."""
     st = []
@@ -685,7 +498,9 @@ def build_cv_story(opt_cv: dict, labels: dict, S: dict) -> list:
             Spacer(1, 5),
         ]
         for sk in skills:
-            skills_block.append(make_skill_row(sk.get('category') or '', sk.get('value') or '', S))
+            skills_block.append(
+                make_skill_row(sk.get('category') or '', sk.get('value') or '', S)
+            )
         skills_block.append(Spacer(1, 8))
         st.append(KeepTogether(skills_block))
 
@@ -703,7 +518,6 @@ def build_cv_story(opt_cv: dict, labels: dict, S: dict) -> list:
     if langs:
         st.append(SectionHeader(labels.get('languages', 'Languages')))
         st.append(Spacer(1, 5))
-        # Render as a single line: Bold(Lang) : Level • Bold(Lang) : Level
         parts = []
         for lang in langs:
             if ':' in lang:
@@ -714,7 +528,7 @@ def build_cv_story(opt_cv: dict, labels: dict, S: dict) -> list:
         st.append(Paragraph('\u2002\u2022\u2002'.join(parts), S['lang']))
         st.append(Spacer(1, 8))
 
-    # ── Certifications (optional) ────────────────────────────────────────────────
+    # ── Certifications ───────────────────────────────────────────────────────────
     certs = opt_cv.get('certifications', [])
     if certs:
         st.append(SectionHeader(labels.get('certifications', 'Certifications')))
@@ -723,7 +537,7 @@ def build_cv_story(opt_cv: dict, labels: dict, S: dict) -> list:
             st.append(Paragraph('<bullet>\u2022</bullet>' + cert, S['project']))
         st.append(Spacer(1, 8))
 
-    # ── Projects (optional) ──────────────────────────────────────────────────────
+    # ── Projects ─────────────────────────────────────────────────────────────────
     projects = opt_cv.get('projects', [])
     if projects:
         st.append(SectionHeader(labels.get('projects', 'Personal Projects')))
@@ -741,15 +555,12 @@ def _count_pdf_pages(buf: io.BytesIO) -> int:
         return len(pdf.pages)
 
 
-def build_cv_pdf(opt_cv: dict, labels: dict, output_path: Path,
-                 target_pages: int) -> int:
-    """
-    Build the CV PDF, auto-scaling body font size to match target_pages.
-    Returns the actual page count achieved.
-    """
+# ── CV PDF builder ──────────────────────────────────────────────────────────────
+def build_cv_pdf(opt_cv: dict, labels: dict, target_pages: int) -> bytes:
+    """Build the CV PDF, auto-scaling body font size to match target_pages.
+    Returns PDF bytes."""
     font_sizes = [8.4, 8.0, 7.6, 7.2, 6.8]
     buf = io.BytesIO()
-    actual = 0
 
     for fs in font_sizes:
         S   = make_styles(body_size=fs)
@@ -770,22 +581,15 @@ def build_cv_pdf(opt_cv: dict, labels: dict, output_path: Path,
         doc.addPageTemplates([PageTemplate(id='main', frames=[frame])])
         doc.build(build_cv_story(opt_cv, labels, S))
 
-        actual = _count_pdf_pages(buf)
+        if _count_pdf_pages(buf) <= target_pages:
+            break
 
-        if actual <= target_pages:
-            # Write to disk
-            output_path.write_bytes(buf.getvalue())
-            return actual
-
-    # Last resort: write at smallest size even if still overflowing
-    output_path.write_bytes(buf.getvalue())
-    return actual
+    return buf.getvalue()
 
 
 # ── Cover Letter PDF builder ────────────────────────────────────────────────────
-def build_cover_letter_pdf(cover_letter_text: str, opt_cv: dict, output_path: Path) -> int:
-    """Render the cover letter as a single-page PDF."""
-    # Override cl_body and cl_meta with bigger, more letter-appropriate sizes
+def build_cover_letter_pdf(cover_letter_text: str, opt_cv: dict) -> bytes:
+    """Render the cover letter as a single-page PDF. Returns PDF bytes."""
     cl_body_style = ParagraphStyle('', fontName=FONT, fontSize=10.5,
                                    textColor=DKGRY, leading=16,
                                    alignment=TA_JUSTIFY, spaceAfter=8)
@@ -797,7 +601,6 @@ def build_cover_letter_pdf(cover_letter_text: str, opt_cv: dict, output_path: Pa
     contact_line  = format_contact_line(contact)
 
     story = [
-        # Letterhead
         Paragraph(opt_cv.get('name', ''), name_style),
         Paragraph(opt_cv.get('title', ''), cl_meta_style),
         Paragraph(contact_line, cl_meta_style),
@@ -805,10 +608,8 @@ def build_cover_letter_pdf(cover_letter_text: str, opt_cv: dict, output_path: Pa
         Spacer(1, 18),
     ]
 
-    # Body paragraphs — split on blank lines to preserve paragraph structure
     paragraphs = [p.strip() for p in cover_letter_text.split('\n\n') if p.strip()]
     for para in paragraphs:
-        # Single newlines within a paragraph → space (preserve flow)
         para_text = para.replace('\n', ' ')
         story.append(Paragraph(para_text, cl_body_style))
 
@@ -828,123 +629,4 @@ def build_cover_letter_pdf(cover_letter_text: str, opt_cv: dict, output_path: Pa
     )
     doc.addPageTemplates([PageTemplate(id='main', frames=[frame])])
     doc.build(story)
-    actual_pages = _count_pdf_pages(buf)
-    output_path.write_bytes(buf.getvalue())
-    return actual_pages
-
-
-# ── Main ─────────────────────────────────────────────────────────────────────────
-def main():
-    # --- Get API key ---
-    api_key = os.environ.get('ANTHROPIC_API_KEY', '').strip()
-    if not api_key:
-        print()
-        print('ANTHROPIC_API_KEY not found in environment or .env file.')
-        api_key = input('Enter your Anthropic API key: ').strip()
-        if not api_key:
-            print('ERROR: API key required.')
-            sys.exit(1)
-        print('Tip: add ANTHROPIC_API_KEY=<your-key> to your .env file to skip this prompt.\n')
-
-    client = anthropic.Anthropic(api_key=api_key)
-
-    # --- Gather inputs ---
-    jd_text, cv_path, company = gather_inputs()
-
-    # --- Extract CV ---
-    print('  Extracting CV text...')
-    cv_text, page_count = extract_cv_pdf(cv_path)
-    if page_count == 0:
-        print('ERROR: CV PDF appears to have 0 pages — file may be corrupted or encrypted.')
-        sys.exit(1)
-    if not cv_text:
-        print('ERROR: Could not extract text from the CV PDF. '
-              'Ensure it is not a scanned/image-only PDF.')
-        sys.exit(1)
-
-    cv_chars    = len(cv_text)
-    cv_filename = cv_path.name
-
-    # --- Claude Call 1: Analysis ---
-    print('  Analysing CV against job description (this takes ~30–60 seconds)...')
-    try:
-        analysis = run_analysis(cv_text, jd_text, client)
-    except Exception as e:
-        print(f'ERROR during analysis: {e}')
-        sys.exit(1)
-
-    print_report(analysis, cv_filename, page_count, cv_chars)
-
-    opt_cv  = analysis.get('optimized_cv') or {}
-    labels  = analysis.get('section_labels') or {}
-    language = analysis.get('language') or 'English'
-
-    if not opt_cv or not opt_cv.get('name'):
-        print('ERROR: Claude returned an empty or malformed CV structure. '
-              'This may be a max_tokens truncation issue. Please re-run.')
-        sys.exit(1)
-
-    # Derive output filename from candidate's last name
-    name_parts   = opt_cv.get('name', 'candidate').split()
-    last_name    = _slugify(name_parts[-1]) if name_parts else 'candidate'
-    company_slug = _slugify(company)
-
-    TMP.mkdir(exist_ok=True)
-    cv_out = TMP / f'cv_opt_{company_slug}_{last_name}.pdf'
-    cl_out = TMP / f'cover_letter_{company_slug}_{last_name}.pdf'
-
-    # --- Build CV PDF ---
-    print('  Generating optimised CV PDF...')
-    try:
-        actual_pages = build_cv_pdf(opt_cv, labels, cv_out, target_pages=page_count)
-        if actual_pages == 0:
-            print('ERROR: Generated CV PDF has 0 pages — ReportLab build failure.')
-            sys.exit(1)
-        page_note = ''
-        if actual_pages != page_count:
-            page_note = f'  (note: target was {page_count}p, result is {actual_pages}p)'
-        print(f'  CV PDF done: {actual_pages} page{"s" if actual_pages > 1 else ""}  '
-              f'{page_note}  \u2713')
-    except Exception as e:
-        print(f'ERROR generating CV PDF: {e}')
-        sys.exit(1)
-
-    # --- Claude Call 2: Cover Letter ---
-    print('  Generating cover letter (this takes ~15–30 seconds)...')
-    try:
-        cover_letter_text = run_cover_letter(
-            cv_text, jd_text, language, opt_cv, company, client
-        )
-    except Exception as e:
-        print(f'ERROR during cover letter generation: {e}')
-        sys.exit(1)
-
-    if not cover_letter_text:
-        print('ERROR: Cover letter text returned empty. Please re-run.')
-        sys.exit(1)
-
-    # --- Build Cover Letter PDF ---
-    try:
-        cl_pages = build_cover_letter_pdf(cover_letter_text, opt_cv, cl_out)
-        page_note_cl = f'  (note: cover letter is {cl_pages}p — check length)' if cl_pages > 1 else ''
-        print(f'  Cover letter PDF done: {cl_pages} page{"s" if cl_pages > 1 else ""}  '
-              f'{page_note_cl}  \u2713')
-    except Exception as e:
-        print(f'ERROR generating cover letter PDF: {e}')
-        sys.exit(1)
-
-    # --- Done ---
-    print()
-    print('  \u2550' * 46)
-    print('  Output files:')
-    print(f'    CV           : {cv_out}')
-    print(f'    Cover Letter : {cl_out}')
-    cv_kb = cv_out.stat().st_size / 1024
-    cl_kb = cl_out.stat().st_size / 1024
-    print(f'    Sizes        : CV {cv_kb:.0f} KB  |  Cover Letter {cl_kb:.0f} KB')
-    print('  \u2550' * 46)
-    print()
-
-
-if __name__ == '__main__':
-    main()
+    return buf.getvalue()
