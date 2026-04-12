@@ -141,15 +141,21 @@ def make_accroche(text, kpi_line, S):
     return t
 
 
-def make_exp_entry(title, company_line, bullets, is_oneliner, S):
+def make_exp_entry(title, company, period, location, bullets, is_oneliner, S):
     """Returns a list of flowables for one experience entry."""
+    # Build the employer details line: "Company, Location — Period"
+    details_parts = [p for p in (company, location) if p]
+    details = ', '.join(details_parts)
+    if period:
+        details += f'\u2002\u2014\u2002{period}'
+
     if is_oneliner:
-        return [Paragraph(f'{title}\u2002\u2014\u2002{company_line}', S['oneliner'])]
+        return [Paragraph(f'{title}\u2002\u2014\u2002{details}', S['oneliner'])]
 
     elems = [
         KeepTogether([
             Paragraph(title, S['role']),
-            Paragraph(company_line, S['employer']),
+            Paragraph(details, S['employer']),
         ])
     ]
     for b in (bullets or []):
@@ -189,7 +195,7 @@ def format_contact_line(contact: dict) -> str:
         val = (contact.get(key) or '').strip()
         if val:
             parts.append(val)
-    for key in ('linkedin', 'github'):
+    for key in ('linkedin', 'github', 'youtube'):
         url = (contact.get(key) or '').strip()
         if url:
             display = url.replace('https://', '').replace('http://', '').rstrip('/')
@@ -211,16 +217,26 @@ Your task is to:
    explaining the score based on the role's specific priorities.
 5. Identify transferable skills where exact matches are missing.
 6. Produce an OPTIMISED version of the entire CV that:
-   - Retains every single section, role, experience, education, certification, project,
-     and skill from the original CV — nothing may be omitted or invented.
+   - CRITICAL: Retains EVERY SINGLE role, position, job, experience entry, education degree,
+     certification, project, and skill from the original CV. Count them in the input and
+     verify the same count appears in your output. Zero omissions are acceptable.
+   - For roles with no bullets in the original (e.g. early career), set is_oneliner=true.
    - Integrates ATS keywords naturally into existing bullet points.
    - Rewrites bullets to be impact-first and quantified where evidence exists in the CV.
+   - Wraps ALL numeric metrics and percentages in <b>...</b> HTML tags in bullet points
+     (e.g. <b>25%</b>, <b>40%</b>, <b>20%</b>, <b>~30%</b>). This is mandatory.
    - Translates the full CV into the language of the job description.
    - Targets an ATS match score of at least 9/10.
    - Is truthful — no fabrication, no exaggeration.
 7. Produce section label names in the language of the job description.
 8. For the cover letter, the optimized_cv summary will be used as context — make it
    compelling and narrative-driven.
+
+Field format rules for optimized_cv.experience items:
+- company: company name only (e.g. "Wiser Solutions")
+- period: employment dates (e.g. "11/2022 - Present")
+- location: city and country (e.g. "Paris, France")
+- is_oneliner: true ONLY for roles with zero bullet points in the original CV
 
 The first 2 seconds of human recruiter review must convey clear, high value for this role.
 Every bullet point should demonstrate measurable impact.
@@ -251,7 +267,7 @@ Rules:
 """.strip()
 
 
-# ── JSON schema for structured Gemini output ────────────────────────────────────
+# ── JSON schema for structured LLM output ───────────────────────────────────────
 CV_ANALYSIS_SCHEMA = {
     "type": "object",
     "required": [
@@ -326,21 +342,25 @@ CV_ANALYSIS_SCHEMA = {
                         "phone":    {"type": "string"},
                         "location": {"type": "string"},
                         "linkedin": {"type": "string"},
-                        "github":   {"type": "string"}
+                        "github":   {"type": "string"},
+                        "youtube":  {"type": "string"}
                     }
                 },
                 "summary":      {"type": "string"},
                 "summary_kpis": {"type": "string"},
                 "experience": {
                     "type": "array",
+                    "description": "ALL roles from the original CV, in chronological order. None may be omitted.",
                     "items": {
                         "type": "object",
-                        "required": ["role", "company_line", "bullets", "is_oneliner"],
+                        "required": ["role", "company", "period", "location", "bullets", "is_oneliner"],
                         "properties": {
-                            "role":         {"type": "string"},
-                            "company_line": {"type": "string"},
-                            "bullets":      {"type": "array", "items": {"type": "string"}},
-                            "is_oneliner":  {"type": "boolean"}
+                            "role":        {"type": "string"},
+                            "company":     {"type": "string"},
+                            "period":      {"type": "string", "description": "e.g. '11/2022 - Present'"},
+                            "location":    {"type": "string", "description": "e.g. 'Paris, France'"},
+                            "bullets":     {"type": "array", "items": {"type": "string"}},
+                            "is_oneliner": {"type": "boolean", "description": "true only for roles with no bullets in original"}
                         }
                     }
                 },
@@ -359,16 +379,38 @@ CV_ANALYSIS_SCHEMA = {
                     "type": "array",
                     "items": {
                         "type": "object",
-                        "required": ["degree", "institution_line"],
+                        "required": ["degree", "institution_line", "period"],
                         "properties": {
                             "degree":           {"type": "string"},
-                            "institution_line": {"type": "string"}
+                            "institution_line": {"type": "string"},
+                            "period":           {"type": "string", "description": "e.g. '09/2019 - 04/2021'"}
                         }
                     }
                 },
-                "languages":      {"type": "array", "items": {"type": "string"}},
+                "languages": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["name", "proficiency"],
+                        "properties": {
+                            "name":        {"type": "string"},
+                            "proficiency": {"type": "string"}
+                        }
+                    }
+                },
                 "certifications": {"type": "array", "items": {"type": "string"}},
-                "projects":       {"type": "array", "items": {"type": "string"}}
+                "projects": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["title"],
+                        "properties": {
+                            "title":       {"type": "string"},
+                            "period":      {"type": "string"},
+                            "description": {"type": "string"}
+                        }
+                    }
+                }
             }
         }
     }
@@ -411,6 +453,7 @@ def run_analysis(cv_text: str, jd_text: str, api_key: str) -> dict:
             {"role": "user",   "content": user_msg},
         ],
         response_format={"type": "json_object"},
+        max_tokens=8000,
     )
     raw = response.choices[0].message.content.strip()
     if raw.startswith("```"):
@@ -480,7 +523,9 @@ def build_cv_story(opt_cv: dict, labels: dict, S: dict) -> list:
         for entry in experience:
             for flowable in make_exp_entry(
                 entry.get('role') or '',
-                entry.get('company_line') or '',
+                entry.get('company') or entry.get('company_line') or '',
+                entry.get('period') or '',
+                entry.get('location') or '',
                 entry.get('bullets') or [],
                 bool(entry.get('is_oneliner')),
                 S,
@@ -509,7 +554,10 @@ def build_cv_story(opt_cv: dict, labels: dict, S: dict) -> list:
         st.append(Spacer(1, 5))
         for edu in education:
             st.append(Paragraph(edu.get('degree') or '', S['edu_title']))
-            st.append(Paragraph(edu.get('institution_line') or '', S['edu_sub']))
+            inst = edu.get('institution_line') or ''
+            period = edu.get('period') or ''
+            inst_display = inst + (f'\u2002\u2014\u2002{period}' if period else '')
+            st.append(Paragraph(inst_display, S['edu_sub']))
 
     # ── Languages ────────────────────────────────────────────────────────────────
     langs = opt_cv.get('languages', [])
@@ -518,11 +566,17 @@ def build_cv_story(opt_cv: dict, labels: dict, S: dict) -> list:
         st.append(Spacer(1, 5))
         parts = []
         for lang in langs:
-            if ':' in lang:
-                name_part, level = lang.split(':', 1)
-                parts.append(f'<b>{name_part.strip()}</b>\u2002:\u2002{level.strip()}')
+            if isinstance(lang, dict):
+                name_part = (lang.get('name') or '').strip()
+                level = (lang.get('proficiency') or '').strip()
+                parts.append(f'<b>{name_part}</b>\u2002:\u2002{level}' if level else name_part)
             else:
-                parts.append(lang)
+                lang_str = str(lang)
+                if ':' in lang_str:
+                    name_part, level = lang_str.split(':', 1)
+                    parts.append(f'<b>{name_part.strip()}</b>\u2002:\u2002{level.strip()}')
+                else:
+                    parts.append(lang_str)
         st.append(Paragraph('\u2002\u2022\u2002'.join(parts), S['lang']))
         st.append(Spacer(1, 8))
 
@@ -541,7 +595,16 @@ def build_cv_story(opt_cv: dict, labels: dict, S: dict) -> list:
         st.append(SectionHeader(labels.get('projects', 'Personal Projects')))
         st.append(Spacer(1, 5))
         for proj in projects:
-            st.append(Paragraph('<bullet>\u2022</bullet>' + proj, S['project']))
+            if isinstance(proj, dict):
+                title = (proj.get('title') or '').strip()
+                period = (proj.get('period') or '').strip()
+                description = (proj.get('description') or '').strip()
+                header = f'<b>{title}</b>' + (f'\u2002({period})' if period else '')
+                st.append(Paragraph('<bullet>\u2022</bullet>' + header, S['project']))
+                if description:
+                    st.append(Paragraph(description, S['project']))
+            else:
+                st.append(Paragraph('<bullet>\u2022</bullet>' + str(proj), S['project']))
 
     return st
 
