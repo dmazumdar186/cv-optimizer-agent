@@ -13,8 +13,7 @@ from datetime import date
 from pathlib import Path
 
 import pdfplumber
-from google import genai
-from google.genai import types as genai_types
+from groq import Groq
 
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle
@@ -394,10 +393,10 @@ def extract_cv_pdf(cv_source) -> tuple[str, int]:
     return full_text, page_count
 
 
-# ── Gemini: CV Analysis ─────────────────────────────────────────────────────────
+# ── Groq: CV Analysis ───────────────────────────────────────────────────────────
 def run_analysis(cv_text: str, jd_text: str, api_key: str) -> dict:
-    """Call Gemini to analyse the CV against the JD. Returns structured dict."""
-    client = genai.Client(api_key=api_key)
+    """Call Groq to analyse the CV against the JD. Returns structured dict."""
+    client = Groq(api_key=api_key)
     schema_hint = json.dumps(CV_ANALYSIS_SCHEMA, ensure_ascii=False)
     user_msg = (
         f"<cv>\n{cv_text}\n</cv>\n\n"
@@ -405,27 +404,26 @@ def run_analysis(cv_text: str, jd_text: str, api_key: str) -> dict:
         "Analyse this CV against the job description. Follow all instructions in your "
         f"system prompt. Return a JSON object exactly matching this schema:\n{schema_hint}"
     )
-    response = client.models.generate_content(
-        model="gemini-1.5-flash",
-        contents=user_msg,
-        config=genai_types.GenerateContentConfig(
-            system_instruction=CV_ADVISOR_SYSTEM,
-            response_mime_type="application/json",
-        ),
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {"role": "system", "content": CV_ADVISOR_SYSTEM},
+            {"role": "user",   "content": user_msg},
+        ],
+        response_format={"type": "json_object"},
     )
-    raw = response.text.strip()
-    # Strip markdown code fences if present
+    raw = response.choices[0].message.content.strip()
     if raw.startswith("```"):
         raw = re.sub(r'^```[a-z]*\n?', '', raw)
         raw = re.sub(r'\n?```$', '', raw.strip())
     return json.loads(raw)
 
 
-# ── Gemini: Cover Letter ────────────────────────────────────────────────────────
+# ── Groq: Cover Letter ──────────────────────────────────────────────────────────
 def run_cover_letter(cv_text: str, jd_text: str, language: str,
                      optimized_cv: dict, company: str, api_key: str) -> str:
-    """Call Gemini to generate a cover letter. Returns plain text."""
-    client = genai.Client(api_key=api_key)
+    """Call Groq to generate a cover letter. Returns plain text."""
+    client = Groq(api_key=api_key)
     summary = optimized_cv.get('summary', '')
     name    = optimized_cv.get('name', '')
     title   = optimized_cv.get('title', '')
@@ -440,14 +438,14 @@ def run_cover_letter(cv_text: str, jd_text: str, language: str,
         "Generate a submission-ready cover letter following all instructions in your system prompt. "
         "Return only the final cover letter text — no commentary, no step-by-step notes."
     )
-    response = client.models.generate_content(
-        model="gemini-1.5-flash",
-        contents=user_msg,
-        config=genai_types.GenerateContentConfig(
-            system_instruction=COVER_LETTER_SYSTEM,
-        ),
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {"role": "system", "content": COVER_LETTER_SYSTEM},
+            {"role": "user",   "content": user_msg},
+        ],
     )
-    return response.text.strip()
+    return response.choices[0].message.content.strip()
 
 
 # ── CV story builder ────────────────────────────────────────────────────────────
