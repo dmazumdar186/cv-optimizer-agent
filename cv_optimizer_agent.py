@@ -8,7 +8,7 @@ inputs: interactive prompts (JD text/path, CV PDF path, company name)
 outputs: .tmp/cv_opt_{company}_{lastname}.pdf, .tmp/cover_letter_{company}_{lastname}.pdf
 
 Usage:
-    py execution/personal_workflows/cv_optimizer_agent.py
+    py cv_optimizer_agent.py
 
 Dependencies:
     pip install reportlab pdfplumber anthropic python-dotenv
@@ -60,7 +60,7 @@ except ImportError:
     sys.exit(1)
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
-ROOT = Path(__file__).resolve().parent.parent.parent
+ROOT = Path(__file__).resolve().parent
 TMP  = ROOT / '.tmp'
 
 # ── Page geometry ──────────────────────────────────────────────────────────────
@@ -627,6 +627,8 @@ def print_report(analysis: dict, cv_filename: str, page_count: int, cv_chars: in
         print('  Key Recommendations:')
         for r in recs[:6]:
             wrapped = textwrap.wrap(r, width=72)
+            if not wrapped:
+                continue
             print(f'    \u2022 {wrapped[0]}')
             for line in wrapped[1:]:
                 print(f'      {line}')
@@ -895,6 +897,9 @@ def main():
     print('  Generating optimised CV PDF...')
     try:
         actual_pages = build_cv_pdf(opt_cv, labels, cv_out, target_pages=page_count)
+        if actual_pages == 0:
+            print('ERROR: Generated CV PDF has 0 pages — ReportLab build failure.')
+            sys.exit(1)
         page_note = ''
         if actual_pages != page_count:
             page_note = f'  (note: target was {page_count}p, result is {actual_pages}p)'
@@ -912,6 +917,10 @@ def main():
         )
     except Exception as e:
         print(f'ERROR during cover letter generation: {e}')
+        sys.exit(1)
+
+    if not cover_letter_text:
+        print('ERROR: Cover letter text returned empty. Please re-run.')
         sys.exit(1)
 
     # --- Build Cover Letter PDF ---
