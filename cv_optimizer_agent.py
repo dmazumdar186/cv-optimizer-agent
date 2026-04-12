@@ -406,7 +406,7 @@ def run_analysis(cv_text: str, jd_text: str, api_key: str) -> dict:
         f"system prompt. Return a JSON object exactly matching this schema:\n{schema_hint}"
     )
     response = client.models.generate_content(
-        model="gemini-2.0-flash",
+        model="gemini-1.5-flash",
         contents=user_msg,
         config=genai_types.GenerateContentConfig(
             system_instruction=CV_ADVISOR_SYSTEM,
@@ -441,7 +441,7 @@ def run_cover_letter(cv_text: str, jd_text: str, language: str,
         "Return only the final cover letter text — no commentary, no step-by-step notes."
     )
     response = client.models.generate_content(
-        model="gemini-2.0-flash",
+        model="gemini-1.5-flash",
         contents=user_msg,
         config=genai_types.GenerateContentConfig(
             system_instruction=COVER_LETTER_SYSTEM,
