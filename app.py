@@ -5,6 +5,7 @@ Deploy: push to GitHub, connect to Streamlit Community Cloud.
 """
 
 import io
+import time
 
 import streamlit as st
 
@@ -16,6 +17,19 @@ from cv_optimizer_agent import (
     run_cover_letter,
     _slugify,
 )
+
+def _call_with_retry(fn, *args, max_attempts=3, backoff=8):
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return fn(*args)
+        except Exception as e:
+            err = str(e)
+            is_quota = "429" in err or "quota" in err.lower() or "rate" in err.lower()
+            if is_quota and attempt < max_attempts:
+                time.sleep(backoff)
+                continue
+            raise
+
 
 st.set_page_config(
     page_title="CV Optimizer",
@@ -80,15 +94,18 @@ if st.button("Optimize my CV →", type="primary"):
     # ── Step 2: Gemini analysis ────────────────────────────────────────────────
     try:
         with st.spinner("Step 1/2: Analysing your CV against the job description..."):
-            analysis = run_analysis(cv_text, jd_text.strip(), api_key)
+            analysis = _call_with_retry(run_analysis, cv_text, jd_text.strip(), api_key)
     except Exception as e:
         err = str(e)
         if "429" in err or "quota" in err.lower() or "rate" in err.lower():
             st.error(
-                "We're at capacity right now. Please try again in a few minutes."
+                "Gemini quota exceeded — the API key needs to be linked to a "
+                "billing-enabled project. See details below."
             )
         else:
             st.error("Something went wrong during analysis. Please try again.")
+        with st.expander("Error details"):
+            st.code(err)
         st.stop()
 
     opt_cv   = analysis.get("optimized_cv") or {}
@@ -102,17 +119,21 @@ if st.button("Optimize my CV →", type="primary"):
     # ── Step 3: Cover letter ───────────────────────────────────────────────────
     try:
         with st.spinner("Step 2/2: Writing your cover letter..."):
-            cover_letter_text = run_cover_letter(
-                cv_text, jd_text.strip(), language, opt_cv, company.strip(), api_key
+            cover_letter_text = _call_with_retry(
+                run_cover_letter,
+                cv_text, jd_text.strip(), language, opt_cv, company.strip(), api_key,
             )
     except Exception as e:
         err = str(e)
         if "429" in err or "quota" in err.lower() or "rate" in err.lower():
             st.error(
-                "We're at capacity right now. Please try again in a few minutes."
+                "Gemini quota exceeded — the API key needs to be linked to a "
+                "billing-enabled project. See details below."
             )
         else:
-            st.error("Something went wrong. Please try again.")
+            st.error("Something went wrong generating the cover letter. Please try again.")
+        with st.expander("Error details"):
+            st.code(err)
         st.stop()
 
     # ── Step 4: Generate PDFs ──────────────────────────────────────────────────
