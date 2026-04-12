@@ -206,44 +206,44 @@ def format_contact_line(contact: dict) -> str:
 
 # ── System prompts ──────────────────────────────────────────────────────────────
 CV_ADVISOR_SYSTEM = """
-You are the world's most intelligent and experienced CV Advisor, combining the precision of an
-advanced ATS system with the strategic insight of an expert human recruiter.
+You are an advanced ATS system and expert senior recruiter.
 
-Your task is to:
-1. Analyse the provided CV against the job description with extreme rigor.
-2. Detect the language of the job description — ALL output must be in that language.
-3. Detect any language or tone mismatch between the CV and job description.
-4. Score each skill listed in the job description using a strategic relevance score (1–10),
-   explaining the score based on the role's specific priorities.
-5. Identify transferable skills where exact matches are missing.
-6. Produce an OPTIMISED version of the entire CV that:
-   - CRITICAL: Retains EVERY SINGLE role, position, job, experience entry, education degree,
-     certification, project, and skill from the original CV. Count them in the input and
-     verify the same count appears in your output. Zero omissions are acceptable.
-   - For roles with no bullets in the original (e.g. early career), set is_oneliner=true.
-   - Integrates ATS keywords naturally into existing bullet points.
-   - Rewrites bullets to be impact-first and quantified where evidence exists in the CV.
-   - Wraps ALL numeric metrics and percentages in <b>...</b> HTML tags in bullet points
-     (e.g. <b>25%</b>, <b>40%</b>, <b>20%</b>, <b>~30%</b>). This is mandatory.
-   - Translates the full CV into the language of the job description.
-   - Targets an ATS match score of at least 9/10.
-   - Is truthful — no fabrication, no exaggeration.
-7. Produce section label names in the language of the job description.
-8. For the cover letter, the optimized_cv summary will be used as context — make it
-   compelling and narrative-driven.
+Your task: analyse the provided CV against the job description and return a JSON object.
 
-Field format rules for optimized_cv.experience items:
-- company: company name only (e.g. "Wiser Solutions")
-- period: employment dates (e.g. "11/2022 - Present")
-- location: city and country (e.g. "Paris, France")
-- is_oneliner: true ONLY for roles with zero bullet points in the original CV
+1. Detect the language of the job description ("language" field).
+2. Score each skill from the JD using a strategic relevance score (1–10).
+3. Identify transferable skills where exact matches are missing.
+4. Produce initial ATS score and projected ATS score after optimisation.
+5. List the top 5 actionable recommendations to reach 9+/10.
+6. Produce section label names translated into the language of the job description.
 
-The first 2 seconds of human recruiter review must convey clear, high value for this role.
-Every bullet point should demonstrate measurable impact.
+Be HYPERCRITICAL in scoring. Most CVs score 4–6 initially. 8+ requires exceptional
+keyword match, quantified achievements, and role-specific language. Do not inflate scores.
+""".strip()
 
-Be HYPERCRITICAL in your scoring. Most CVs score 4–6 initially. A score of 8 or above
-requires exceptional keyword match, quantified achievements, and role-specific language.
-Do not inflate scores.
+CV_OPTIMIZER_SYSTEM = """
+You are an expert CV writer and ATS specialist. Your ONLY task: rewrite a candidate's CV
+to maximise ATS alignment with a job description, then return it as a JSON object.
+
+ABSOLUTE RULES — each violation is a critical failure:
+
+1. RETAIN EVERY ROLE. Count every job/position in the original CV. Your experience array
+   MUST contain the identical number of entries. If the original has 7 roles, output 7.
+   Early-career roles with no bullets → set is_oneliner=true and bullets=[].
+
+2. PRESERVE DATES AND LOCATIONS. Copy exact dates (e.g. "11/2022 - Present") and locations
+   (e.g. "Paris, France") from the original for every role and every education entry.
+
+3. BOLD ALL METRICS. Every number, percentage, and metric in bullets MUST be wrapped in
+   <b>...</b> HTML tags. Examples: <b>25%</b>, <b>40%</b>, <b>14+ years</b>, <b>~30%</b>.
+
+4. COMPLETE OUTPUT. Output the full JSON — no truncation, no placeholders, no "...".
+   Every field in the schema must be populated. Every experience entry needs all 6 fields.
+
+5. WRITE IN: {language}
+
+6. NO FABRICATION. Integrate JD keywords naturally into existing bullets only. Do not
+   invent metrics, companies, or skills not evidenced in the original CV.
 """.strip()
 
 COVER_LETTER_SYSTEM = """
@@ -267,12 +267,12 @@ Rules:
 """.strip()
 
 
-# ── JSON schema for structured LLM output ───────────────────────────────────────
+# ── JSON schema — Pass 1: analysis only ─────────────────────────────────────────
 CV_ANALYSIS_SCHEMA = {
     "type": "object",
     "required": [
         "language", "ats_score_initial", "ats_score_improved",
-        "skill_matrix", "recommendations", "section_labels", "optimized_cv"
+        "skill_matrix", "recommendations", "section_labels"
     ],
     "properties": {
         "language": {
@@ -324,92 +324,94 @@ CV_ANALYSIS_SCHEMA = {
                 "certifications": {"type": "string"},
                 "projects":       {"type": "string"}
             }
-        },
-        "optimized_cv": {
+        }
+    }
+}
+
+# ── JSON schema — Pass 2: optimized CV only ──────────────────────────────────────
+OPTIMIZED_CV_SCHEMA = {
+    "type": "object",
+    "required": [
+        "name", "title", "contact", "summary", "summary_kpis",
+        "experience", "skills", "education", "languages",
+        "certifications", "projects"
+    ],
+    "properties": {
+        "name":  {"type": "string"},
+        "title": {"type": "string"},
+        "contact": {
             "type": "object",
-            "required": [
-                "name", "title", "contact", "summary", "summary_kpis",
-                "experience", "skills", "education", "languages",
-                "certifications", "projects"
-            ],
             "properties": {
-                "name":  {"type": "string"},
-                "title": {"type": "string"},
-                "contact": {
-                    "type": "object",
-                    "properties": {
-                        "email":    {"type": "string"},
-                        "phone":    {"type": "string"},
-                        "location": {"type": "string"},
-                        "linkedin": {"type": "string"},
-                        "github":   {"type": "string"},
-                        "youtube":  {"type": "string"}
-                    }
-                },
-                "summary":      {"type": "string"},
-                "summary_kpis": {"type": "string"},
-                "experience": {
-                    "type": "array",
-                    "description": "ALL roles from the original CV, in chronological order. None may be omitted.",
-                    "items": {
-                        "type": "object",
-                        "required": ["role", "company", "period", "location", "bullets", "is_oneliner"],
-                        "properties": {
-                            "role":        {"type": "string"},
-                            "company":     {"type": "string"},
-                            "period":      {"type": "string", "description": "e.g. '11/2022 - Present'"},
-                            "location":    {"type": "string", "description": "e.g. 'Paris, France'"},
-                            "bullets":     {"type": "array", "items": {"type": "string"}},
-                            "is_oneliner": {"type": "boolean", "description": "true only for roles with no bullets in original"}
-                        }
-                    }
-                },
-                "skills": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "required": ["category", "value"],
-                        "properties": {
-                            "category": {"type": "string"},
-                            "value":    {"type": "string"}
-                        }
-                    }
-                },
-                "education": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "required": ["degree", "institution_line", "period"],
-                        "properties": {
-                            "degree":           {"type": "string"},
-                            "institution_line": {"type": "string"},
-                            "period":           {"type": "string", "description": "e.g. '09/2019 - 04/2021'"}
-                        }
-                    }
-                },
-                "languages": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "required": ["name", "proficiency"],
-                        "properties": {
-                            "name":        {"type": "string"},
-                            "proficiency": {"type": "string"}
-                        }
-                    }
-                },
-                "certifications": {"type": "array", "items": {"type": "string"}},
-                "projects": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "required": ["title"],
-                        "properties": {
-                            "title":       {"type": "string"},
-                            "period":      {"type": "string"},
-                            "description": {"type": "string"}
-                        }
-                    }
+                "email":    {"type": "string"},
+                "phone":    {"type": "string"},
+                "location": {"type": "string"},
+                "linkedin": {"type": "string"},
+                "github":   {"type": "string"},
+                "youtube":  {"type": "string"}
+            }
+        },
+        "summary":      {"type": "string"},
+        "summary_kpis": {"type": "string"},
+        "experience": {
+            "type": "array",
+            "description": "ALL roles from the original CV, none omitted.",
+            "items": {
+                "type": "object",
+                "required": ["role", "company", "period", "location", "bullets", "is_oneliner"],
+                "properties": {
+                    "role":        {"type": "string"},
+                    "company":     {"type": "string"},
+                    "period":      {"type": "string", "description": "e.g. '11/2022 - Present'"},
+                    "location":    {"type": "string", "description": "e.g. 'Paris, France'"},
+                    "bullets":     {"type": "array", "items": {"type": "string"}},
+                    "is_oneliner": {"type": "boolean"}
+                }
+            }
+        },
+        "skills": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["category", "value"],
+                "properties": {
+                    "category": {"type": "string"},
+                    "value":    {"type": "string"}
+                }
+            }
+        },
+        "education": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["degree", "institution_line", "period"],
+                "properties": {
+                    "degree":           {"type": "string"},
+                    "institution_line": {"type": "string"},
+                    "period":           {"type": "string", "description": "e.g. '09/2019 - 04/2021'"}
+                }
+            }
+        },
+        "languages": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["name", "proficiency"],
+                "properties": {
+                    "name":        {"type": "string"},
+                    "proficiency": {"type": "string"}
+                }
+            }
+        },
+        "certifications": {"type": "array", "items": {"type": "string"}},
+        "projects": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["title"],
+                "properties": {
+                    "title":       {"type": "string"},
+                    "period":      {"type": "string"},
+                    "description": {"type": "string"}
                 }
             }
         }
@@ -435,31 +437,60 @@ def extract_cv_pdf(cv_source) -> tuple[str, int]:
     return full_text, page_count
 
 
-# ── Groq: CV Analysis ───────────────────────────────────────────────────────────
-def run_analysis(cv_text: str, jd_text: str, api_key: str) -> dict:
-    """Call Groq to analyse the CV against the JD. Returns structured dict."""
-    client = Groq(api_key=api_key)
-    schema_hint = json.dumps(CV_ANALYSIS_SCHEMA, ensure_ascii=False)
-    user_msg = (
-        f"<cv>\n{cv_text}\n</cv>\n\n"
-        f"<job_description>\n{jd_text}\n</job_description>\n\n"
-        "Analyse this CV against the job description. Follow all instructions in your "
-        f"system prompt. Return a JSON object exactly matching this schema:\n{schema_hint}"
-    )
-    response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[
-            {"role": "system", "content": CV_ADVISOR_SYSTEM},
-            {"role": "user",   "content": user_msg},
-        ],
-        response_format={"type": "json_object"},
-        max_tokens=8000,
-    )
-    raw = response.choices[0].message.content.strip()
+# ── Groq: CV Analysis (two-pass) ────────────────────────────────────────────────
+def _parse_json(raw: str) -> dict:
+    """Strip optional code fences and parse JSON."""
+    raw = raw.strip()
     if raw.startswith("```"):
         raw = re.sub(r'^```[a-z]*\n?', '', raw)
         raw = re.sub(r'\n?```$', '', raw.strip())
     return json.loads(raw)
+
+
+def run_analysis(cv_text: str, jd_text: str, api_key: str) -> dict:
+    """Two-pass analysis: scores first, full CV rewrite second.
+    Returns a merged dict with both analysis fields and optimized_cv."""
+    client = Groq(api_key=api_key)
+
+    # ── Pass 1: Analysis (scores, skill matrix, recommendations) ────────────────
+    analysis_schema = json.dumps(CV_ANALYSIS_SCHEMA, ensure_ascii=False)
+    r1 = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {"role": "system", "content": CV_ADVISOR_SYSTEM},
+            {"role": "user", "content": (
+                f"<cv>\n{cv_text}\n</cv>\n\n"
+                f"<job_description>\n{jd_text}\n</job_description>\n\n"
+                "Analyse this CV against the job description. "
+                f"Return a JSON object exactly matching this schema:\n{analysis_schema}"
+            )},
+        ],
+        response_format={"type": "json_object"},
+        max_tokens=3000,
+    )
+    analysis = _parse_json(r1.choices[0].message.content)
+    language = analysis.get('language', 'English')
+
+    # ── Pass 2: Full CV rewrite (dedicated, high token budget) ──────────────────
+    opt_schema = json.dumps(OPTIMIZED_CV_SCHEMA, ensure_ascii=False)
+    r2 = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {"role": "system", "content": CV_OPTIMIZER_SYSTEM.format(language=language)},
+            {"role": "user", "content": (
+                f"<original_cv>\n{cv_text}\n</original_cv>\n\n"
+                f"<job_description>\n{jd_text}\n</job_description>\n\n"
+                "Rewrite the full CV to maximise ATS alignment. "
+                f"Return a JSON object exactly matching this schema:\n{opt_schema}"
+            )},
+        ],
+        response_format={"type": "json_object"},
+        max_tokens=8000,
+    )
+    optimized_cv = _parse_json(r2.choices[0].message.content)
+
+    analysis['optimized_cv'] = optimized_cv
+    return analysis
 
 
 # ── Groq: Cover Letter ──────────────────────────────────────────────────────────
