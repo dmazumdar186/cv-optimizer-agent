@@ -232,20 +232,31 @@ Be HYPERCRITICAL in scoring. Most CVs score 4–6 initially. 8+ requires excepti
 keyword match, quantified achievements, and role-specific language. Do not inflate scores.
 """.strip()
 
+SKELETON_SYSTEM = """
+You are a precise CV parser. Your ONLY task: extract every distinct job role from the CV.
+
+CRITICAL MANDATE:
+- Count the total number of distinct roles in the CV FIRST.
+- Output EXACTLY that many entries in experience_skeleton — no more, no less.
+- Do NOT skip roles because they are old, short, or seem irrelevant.
+- Do NOT merge multiple roles into one entry.
+- Do NOT write bullet points. Do NOT rewrite anything.
+- Preserve exact role titles, company names, dates, and locations verbatim from the CV.
+- Write in: {language}
+""".strip()
+
 CV_STATIC_SYSTEM = """
-You are an expert CV writer. Your task has two parts:
+You are an expert CV writer. Rewrite the non-experience sections of this CV to maximise
+ATS alignment with the job description.
 
-PART A — Rewrite the non-experience sections (summary, skills, education, languages,
-certifications, projects, contact) to maximise ATS alignment with the job description.
-
-PART B — Extract a skeleton of EVERY experience entry from the original CV:
-role title, company name, period, location, and whether it is a one-liner role.
-Do NOT write any bullet points — output empty arrays only.
+Sections to rewrite: name, title, contact, summary (3–4 sentences), summary_kpis,
+skills (categories + values), education, languages, certifications, projects.
 
 RULES:
-- Preserve exact dates, locations, and names from the original CV.
+- Do NOT include experience entries — only the sections listed above.
+- Preserve exact names, institutions, degrees, and dates from the original CV.
 - Write in: {language}
-- No fabrication. No truncation. Complete JSON only.
+- No fabrication. Complete JSON only.
 """.strip()
 
 CV_BULLETS_SYSTEM = """
@@ -345,13 +356,39 @@ CV_ANALYSIS_SCHEMA = {
     }
 }
 
-# ── JSON schema — Pass 2: static sections + experience skeleton ──────────────────
+# ── JSON schema — Pass 2A: skeleton extraction only ─────────────────────────────
+SKELETON_SCHEMA = {
+    "type": "object",
+    "required": ["role_count", "experience_skeleton"],
+    "properties": {
+        "role_count": {
+            "type": "integer",
+            "description": "Total number of distinct roles counted in the CV"
+        },
+        "experience_skeleton": {
+            "type": "array",
+            "description": "ALL roles from the original CV — every job, none omitted. No bullets.",
+            "items": {
+                "type": "object",
+                "required": ["role", "company", "period", "location", "is_oneliner"],
+                "properties": {
+                    "role":        {"type": "string"},
+                    "company":     {"type": "string"},
+                    "period":      {"type": "string", "description": "e.g. '11/2022 - Present'"},
+                    "location":    {"type": "string", "description": "e.g. 'Paris, France'"},
+                    "is_oneliner": {"type": "boolean"}
+                }
+            }
+        }
+    }
+}
+
+# ── JSON schema — Pass 2B: static sections only (no experience) ──────────────────
 STATIC_CV_SCHEMA = {
     "type": "object",
     "required": [
         "name", "title", "contact", "summary", "summary_kpis",
-        "skills", "education", "languages", "certifications", "projects",
-        "experience_skeleton"
+        "skills", "education", "languages", "certifications", "projects"
     ],
     "properties": {
         "name":  {"type": "string"},
@@ -415,21 +452,6 @@ STATIC_CV_SCHEMA = {
                     "description": {"type": "string"}
                 }
             }
-        },
-        "experience_skeleton": {
-            "type": "array",
-            "description": "ALL roles from the original CV — every job, none omitted. No bullets.",
-            "items": {
-                "type": "object",
-                "required": ["role", "company", "period", "location", "is_oneliner"],
-                "properties": {
-                    "role":        {"type": "string"},
-                    "company":     {"type": "string"},
-                    "period":      {"type": "string", "description": "e.g. '11/2022 - Present'"},
-                    "location":    {"type": "string", "description": "e.g. 'Paris, France'"},
-                    "is_oneliner": {"type": "boolean"}
-                }
-            }
         }
     }
 }
@@ -469,7 +491,9 @@ def extract_cv_pdf(cv_source) -> tuple[str, int]:
         page_count = len(pdf.pages)
         pages_text = []
         for page in pdf.pages:
-            text = page.extract_text()
+            # layout=True preserves spatial positioning via whitespace, preventing
+            # right-aligned dates/locations from being dropped in multi-column CVs.
+            text = page.extract_text(layout=True)
             if text:
                 pages_text.append(text)
     full_text = '\n\n'.join(pages_text).strip()
@@ -487,17 +511,21 @@ def _parse_json(raw: str) -> dict:
 
 
 def run_analysis(cv_text: str, jd_text: str, api_key: str) -> dict:
-    """Skeleton-first pipeline: 4 passes to guarantee all roles are retained.
+    """5-pass pipeline with 2A/2B split to guarantee all roles are retained.
 
-    Pass 1 (llama-3.1-8b-instant): ATS analysis — language, scores, skill matrix,
-            recommendations, section labels. Uses a separate TPM pool.
-    Pass 2 (llama-3.3-70b): Static sections (summary, skills, edu, etc.) +
-            experience skeleton — role/company/period/location, NO bullets.
-    Passes 3…K (llama-3.3-70b): Bullets for each batch of _EXP_BATCH_SIZE roles.
-    Merge: full optimized_cv dict assembled in Python, same shape as before.
+    Pass 1  (llama-3.1-8b-instant): ATS analysis — language, scores, skill matrix,
+            recommendations, section labels.
+    Pass 2A (llama-3.1-8b-instant): Skeleton extraction ONLY — dedicated call with
+            no token competition from verbose section rewrites. role_count field
+            forces the model to count before outputting.
+    Pass 2B (llama-3.3-70b): Static section rewrites ONLY — no experience_skeleton
+            in the schema so the full token budget goes to prose quality.
+    Passes 3…K (llama-3.3-70b): Bullet batches, with metadata merge to preserve
+            period + location from the authoritative skeleton.
+    Merge: full optimized_cv dict assembled in Python.
     """
-    client    = Groq(api_key=api_key)
-    jd_short  = _truncate_jd(jd_text)
+    client   = Groq(api_key=api_key)
+    jd_short = _truncate_jd(jd_text)
 
     # ── Pass 1: Analysis (8b-instant — separate TPM pool, fast) ─────────────────
     r1 = client.chat.completions.create(
@@ -519,8 +547,31 @@ def run_analysis(cv_text: str, jd_text: str, api_key: str) -> dict:
     analysis = _parse_json(r1.choices[0].message.content)
     language = analysis.get('language', 'English')
 
-    # ── Pass 2: Static sections + experience skeleton (70b) ─────────────────────
-    r2 = client.chat.completions.create(
+    # ── Pass 2A: Skeleton extraction ONLY (8b-instant — no token competition) ────
+    # Dedicated call with a minimal schema. role_count forces the model to count
+    # roles before generating, eliminating silent truncation of the array.
+    r2a = client.chat.completions.create(
+        model="llama-3.1-8b-instant",
+        messages=[
+            {"role": "system",
+             "content": SKELETON_SYSTEM.format(language=language)},
+            {"role": "user", "content": (
+                f"<original_cv>\n{cv_text}\n</original_cv>\n\n"
+                "Return a JSON object exactly matching this schema:\n"
+                f"{json.dumps(SKELETON_SCHEMA, ensure_ascii=False)}"
+            )},
+        ],
+        response_format={"type": "json_object"},
+        max_tokens=2000,
+        temperature=0.0,
+    )
+    skeleton_result = _parse_json(r2a.choices[0].message.content)
+    skeleton        = skeleton_result.get('experience_skeleton', [])
+
+    # ── Pass 2B: Static section rewrites ONLY (70b — no skeleton in schema) ─────
+    # experience_skeleton is NOT in STATIC_CV_SCHEMA, so the full token budget
+    # goes to high-quality ATS rewrites without competing for skeleton completeness.
+    r2b = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=[
             {"role": "system",
@@ -533,11 +584,10 @@ def run_analysis(cv_text: str, jd_text: str, api_key: str) -> dict:
             )},
         ],
         response_format={"type": "json_object"},
-        max_tokens=3500,
+        max_tokens=4096,
         temperature=0.01,
     )
-    static_cv = _parse_json(r2.choices[0].message.content)
-    skeleton  = static_cv.pop('experience_skeleton', [])
+    static_cv = _parse_json(r2b.choices[0].message.content)
 
     # ── Passes 3…K: Bullet generation in batches of _EXP_BATCH_SIZE ─────────────
     bulk_schema          = json.dumps(EXPERIENCE_BULLETS_SCHEMA, ensure_ascii=False)
@@ -566,8 +616,19 @@ def run_analysis(cv_text: str, jd_text: str, api_key: str) -> dict:
                 max_tokens=2000,
                 temperature=0.01,
             )
-            batch_result = _parse_json(r_exp.choices[0].message.content)
-            optimized_experience.extend(batch_result.get('experience', chunk))
+            batch_result   = _parse_json(r_exp.choices[0].message.content)
+            bullet_entries = batch_result.get('experience', [])
+            # Merge skeleton metadata into bullet output so period + location
+            # (from the authoritative 2A extraction) are never lost.
+            for j, entry in enumerate(bullet_entries):
+                if j < len(chunk):
+                    merged = {**chunk[j], **entry}
+                    for key in ('period', 'location', 'role', 'company'):
+                        if not merged.get(key) and chunk[j].get(key):
+                            merged[key] = chunk[j][key]
+                    optimized_experience.append(merged)
+                else:
+                    optimized_experience.append(entry)
         except Exception:
             # Fallback: keep skeleton entries with empty bullets rather than crash
             for entry in chunk:
