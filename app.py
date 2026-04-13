@@ -115,6 +115,10 @@ if st.button("Optimize my CV →", type="primary"):
         st.error("Something went wrong. Please try again.")
         st.stop()
 
+    if len((analysis.get("optimized_cv") or {}).get("experience", [])) == 0:
+        st.error("CV rewrite returned no experience entries. Please try again.")
+        st.stop()
+
     # ── Step 3: Cover letter ───────────────────────────────────────────────────
     try:
         with st.spinner("Step 2/2: Writing your cover letter..."):

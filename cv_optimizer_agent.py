@@ -9,6 +9,7 @@ import io
 import json
 import os
 import re
+import time
 from datetime import date
 from pathlib import Path
 
@@ -60,6 +61,10 @@ def _register_fonts():
     return 'Helvetica', 'Helvetica-Bold'
 
 FONT, FONT_BOLD = _register_fonts()
+
+# ── Pipeline constants ───────────────────────────────────────────────────────────
+_JD_SUMMARY_WORDS = 400   # truncate JD for experience batch calls to save TPM
+_EXP_BATCH_SIZE   = 2     # roles per bullet-generation call
 
 
 # ── Custom flowable: coloured section header ────────────────────────────────────
@@ -188,6 +193,12 @@ def _slugify(s: str) -> str:
     return (s or 'unknown')[:80]
 
 
+def _truncate_jd(jd: str, max_words: int = _JD_SUMMARY_WORDS) -> str:
+    """Truncate job description to max_words to reduce TPM per batch call."""
+    words = jd.split()
+    return ' '.join(words[:max_words]) + ('\u2026' if len(words) > max_words else '')
+
+
 def format_contact_line(contact: dict) -> str:
     """Build HTML-enabled contact line with clickable links."""
     parts = []
@@ -221,29 +232,35 @@ Be HYPERCRITICAL in scoring. Most CVs score 4–6 initially. 8+ requires excepti
 keyword match, quantified achievements, and role-specific language. Do not inflate scores.
 """.strip()
 
-CV_OPTIMIZER_SYSTEM = """
-You are an expert CV writer and ATS specialist. Your ONLY task: rewrite a candidate's CV
-to maximise ATS alignment with a job description, then return it as a JSON object.
+CV_STATIC_SYSTEM = """
+You are an expert CV writer. Your task has two parts:
 
-ABSOLUTE RULES — each violation is a critical failure:
+PART A — Rewrite the non-experience sections (summary, skills, education, languages,
+certifications, projects, contact) to maximise ATS alignment with the job description.
 
-1. RETAIN EVERY ROLE. Count every job/position in the original CV. Your experience array
-   MUST contain the identical number of entries. If the original has 7 roles, output 7.
-   Early-career roles with no bullets → set is_oneliner=true and bullets=[].
+PART B — Extract a skeleton of EVERY experience entry from the original CV:
+role title, company name, period, location, and whether it is a one-liner role.
+Do NOT write any bullet points — output empty arrays only.
 
-2. PRESERVE DATES AND LOCATIONS. Copy exact dates (e.g. "11/2022 - Present") and locations
-   (e.g. "Paris, France") from the original for every role and every education entry.
+RULES:
+- Preserve exact dates, locations, and names from the original CV.
+- Write in: {language}
+- No fabrication. No truncation. Complete JSON only.
+""".strip()
 
-3. BOLD ALL METRICS. Every number, percentage, and metric in bullets MUST be wrapped in
-   <b>...</b> HTML tags. Examples: <b>25%</b>, <b>40%</b>, <b>14+ years</b>, <b>~30%</b>.
+CV_BULLETS_SYSTEM = """
+You are an expert CV writer and ATS specialist. For each experience entry provided,
+write 3–5 ATS-optimised bullet points by integrating keywords from the job description
+into the candidate's real achievements found in the original CV.
 
-4. COMPLETE OUTPUT. Output the full JSON — no truncation, no placeholders, no "...".
-   Every field in the schema must be populated. Every experience entry needs all 6 fields.
-
-5. WRITE IN: {language}
-
-6. NO FABRICATION. Integrate JD keywords naturally into existing bullets only. Do not
-   invent metrics, companies, or skills not evidenced in the original CV.
+ABSOLUTE RULES:
+- Copy role, company, period, location verbatim from the input — do not alter them.
+- Wrap every number, percentage, and metric in <b>…</b> HTML tags.
+  Examples: <b>40%</b>, <b>14+ years</b>, <b>~30%</b>, <b>25%</b>
+- Do NOT invent metrics, companies, or skills not in the original CV.
+- is_oneliner=true entries must have bullets=[].
+- Write in: {language}
+- Output ONLY the raw JSON object — no commentary, no code fences.
 """.strip()
 
 COVER_LETTER_SYSTEM = """
@@ -328,13 +345,13 @@ CV_ANALYSIS_SCHEMA = {
     }
 }
 
-# ── JSON schema — Pass 2: optimized CV only ──────────────────────────────────────
-OPTIMIZED_CV_SCHEMA = {
+# ── JSON schema — Pass 2: static sections + experience skeleton ──────────────────
+STATIC_CV_SCHEMA = {
     "type": "object",
     "required": [
         "name", "title", "contact", "summary", "summary_kpis",
-        "experience", "skills", "education", "languages",
-        "certifications", "projects"
+        "skills", "education", "languages", "certifications", "projects",
+        "experience_skeleton"
     ],
     "properties": {
         "name":  {"type": "string"},
@@ -352,22 +369,6 @@ OPTIMIZED_CV_SCHEMA = {
         },
         "summary":      {"type": "string"},
         "summary_kpis": {"type": "string"},
-        "experience": {
-            "type": "array",
-            "description": "ALL roles from the original CV, none omitted.",
-            "items": {
-                "type": "object",
-                "required": ["role", "company", "period", "location", "bullets", "is_oneliner"],
-                "properties": {
-                    "role":        {"type": "string"},
-                    "company":     {"type": "string"},
-                    "period":      {"type": "string", "description": "e.g. '11/2022 - Present'"},
-                    "location":    {"type": "string", "description": "e.g. 'Paris, France'"},
-                    "bullets":     {"type": "array", "items": {"type": "string"}},
-                    "is_oneliner": {"type": "boolean"}
-                }
-            }
-        },
         "skills": {
             "type": "array",
             "items": {
@@ -387,7 +388,7 @@ OPTIMIZED_CV_SCHEMA = {
                 "properties": {
                     "degree":           {"type": "string"},
                     "institution_line": {"type": "string"},
-                    "period":           {"type": "string", "description": "e.g. '09/2019 - 04/2021'"}
+                    "period":           {"type": "string"}
                 }
             }
         },
@@ -412,6 +413,44 @@ OPTIMIZED_CV_SCHEMA = {
                     "title":       {"type": "string"},
                     "period":      {"type": "string"},
                     "description": {"type": "string"}
+                }
+            }
+        },
+        "experience_skeleton": {
+            "type": "array",
+            "description": "ALL roles from the original CV — every job, none omitted. No bullets.",
+            "items": {
+                "type": "object",
+                "required": ["role", "company", "period", "location", "is_oneliner"],
+                "properties": {
+                    "role":        {"type": "string"},
+                    "company":     {"type": "string"},
+                    "period":      {"type": "string", "description": "e.g. '11/2022 - Present'"},
+                    "location":    {"type": "string", "description": "e.g. 'Paris, France'"},
+                    "is_oneliner": {"type": "boolean"}
+                }
+            }
+        }
+    }
+}
+
+# ── JSON schema — Passes 3…K: experience bullets per batch ───────────────────────
+EXPERIENCE_BULLETS_SCHEMA = {
+    "type": "object",
+    "required": ["experience"],
+    "properties": {
+        "experience": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["role", "company", "period", "location", "bullets", "is_oneliner"],
+                "properties": {
+                    "role":        {"type": "string"},
+                    "company":     {"type": "string"},
+                    "period":      {"type": "string"},
+                    "location":    {"type": "string"},
+                    "bullets":     {"type": "array", "items": {"type": "string"}},
+                    "is_oneliner": {"type": "boolean"}
                 }
             }
         }
@@ -448,48 +487,94 @@ def _parse_json(raw: str) -> dict:
 
 
 def run_analysis(cv_text: str, jd_text: str, api_key: str) -> dict:
-    """Two-pass analysis: scores first, full CV rewrite second.
-    Returns a merged dict with both analysis fields and optimized_cv."""
-    client = Groq(api_key=api_key)
+    """Skeleton-first pipeline: 4 passes to guarantee all roles are retained.
 
-    # ── Pass 1: Analysis (scores, skill matrix, recommendations) ────────────────
-    analysis_schema = json.dumps(CV_ANALYSIS_SCHEMA, ensure_ascii=False)
+    Pass 1 (llama-3.1-8b-instant): ATS analysis — language, scores, skill matrix,
+            recommendations, section labels. Uses a separate TPM pool.
+    Pass 2 (llama-3.3-70b): Static sections (summary, skills, edu, etc.) +
+            experience skeleton — role/company/period/location, NO bullets.
+    Passes 3…K (llama-3.3-70b): Bullets for each batch of _EXP_BATCH_SIZE roles.
+    Merge: full optimized_cv dict assembled in Python, same shape as before.
+    """
+    client    = Groq(api_key=api_key)
+    jd_short  = _truncate_jd(jd_text)
+
+    # ── Pass 1: Analysis (8b-instant — separate TPM pool, fast) ─────────────────
     r1 = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
+        model="llama-3.1-8b-instant",
         messages=[
             {"role": "system", "content": CV_ADVISOR_SYSTEM},
             {"role": "user", "content": (
                 f"<cv>\n{cv_text}\n</cv>\n\n"
                 f"<job_description>\n{jd_text}\n</job_description>\n\n"
                 "Analyse this CV against the job description. "
-                f"Return a JSON object exactly matching this schema:\n{analysis_schema}"
+                f"Return a JSON object exactly matching this schema:\n"
+                f"{json.dumps(CV_ANALYSIS_SCHEMA, ensure_ascii=False)}"
             )},
         ],
         response_format={"type": "json_object"},
-        max_tokens=3000,
+        max_tokens=2000,
+        temperature=0.01,
     )
     analysis = _parse_json(r1.choices[0].message.content)
     language = analysis.get('language', 'English')
 
-    # ── Pass 2: Full CV rewrite (dedicated, high token budget) ──────────────────
-    opt_schema = json.dumps(OPTIMIZED_CV_SCHEMA, ensure_ascii=False)
+    # ── Pass 2: Static sections + experience skeleton (70b) ─────────────────────
     r2 = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=[
-            {"role": "system", "content": CV_OPTIMIZER_SYSTEM.format(language=language)},
+            {"role": "system",
+             "content": CV_STATIC_SYSTEM.format(language=language)},
             {"role": "user", "content": (
                 f"<original_cv>\n{cv_text}\n</original_cv>\n\n"
-                f"<job_description>\n{jd_text}\n</job_description>\n\n"
-                "Rewrite the full CV to maximise ATS alignment. "
-                f"Return a JSON object exactly matching this schema:\n{opt_schema}"
+                f"<job_description>\n{jd_short}\n</job_description>\n\n"
+                "Return a JSON object exactly matching this schema:\n"
+                f"{json.dumps(STATIC_CV_SCHEMA, ensure_ascii=False)}"
             )},
         ],
         response_format={"type": "json_object"},
-        max_tokens=8000,
+        max_tokens=2000,
+        temperature=0.01,
     )
-    optimized_cv = _parse_json(r2.choices[0].message.content)
+    static_cv = _parse_json(r2.choices[0].message.content)
+    skeleton  = static_cv.pop('experience_skeleton', [])
 
-    analysis['optimized_cv'] = optimized_cv
+    # ── Passes 3…K: Bullet generation in batches of _EXP_BATCH_SIZE ─────────────
+    bulk_schema          = json.dumps(EXPERIENCE_BULLETS_SCHEMA, ensure_ascii=False)
+    optimized_experience = []
+
+    for i in range(0, len(skeleton), _EXP_BATCH_SIZE):
+        chunk = skeleton[i : i + _EXP_BATCH_SIZE]
+        if i > 0:
+            time.sleep(3)   # pace 70b calls to stay under 12k TPM/min free tier
+        try:
+            r_exp = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[
+                    {"role": "system",
+                     "content": CV_BULLETS_SYSTEM.format(language=language)},
+                    {"role": "user", "content": (
+                        f"Roles to optimise:\n"
+                        f"{json.dumps(chunk, ensure_ascii=False)}\n\n"
+                        f"<original_cv>\n{cv_text}\n</original_cv>\n\n"
+                        f"<job_keywords>\n{jd_short}\n</job_keywords>\n\n"
+                        f"Return a JSON object exactly matching this schema:\n"
+                        f"{bulk_schema}"
+                    )},
+                ],
+                response_format={"type": "json_object"},
+                max_tokens=2000,
+                temperature=0.01,
+            )
+            batch_result = _parse_json(r_exp.choices[0].message.content)
+            optimized_experience.extend(batch_result.get('experience', chunk))
+        except Exception:
+            # Fallback: keep skeleton entries with empty bullets rather than crash
+            for entry in chunk:
+                optimized_experience.append({**entry, 'bullets': []})
+
+    static_cv['experience'] = optimized_experience
+    analysis['optimized_cv'] = static_cv
     return analysis
 
 
