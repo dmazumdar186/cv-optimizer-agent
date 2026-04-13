@@ -533,7 +533,7 @@ def run_analysis(cv_text: str, jd_text: str, api_key: str) -> dict:
             )},
         ],
         response_format={"type": "json_object"},
-        max_tokens=2000,
+        max_tokens=3500,
         temperature=0.01,
     )
     static_cv = _parse_json(r2.choices[0].message.content)

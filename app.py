@@ -119,6 +119,20 @@ if st.button("Optimize my CV →", type="primary"):
         st.error("CV rewrite returned no experience entries. Please try again.")
         st.stop()
 
+    n_roles = len(opt_cv.get("experience", []))
+    st.info(f"✓ {n_roles} experience {'entry' if n_roles == 1 else 'entries'} optimised")
+
+    empty_bullet_roles = [
+        e.get("role", "?")
+        for e in opt_cv.get("experience", [])
+        if not e.get("is_oneliner") and not e.get("bullets")
+    ]
+    if empty_bullet_roles:
+        st.warning(
+            f"Bullet generation failed for: {', '.join(empty_bullet_roles)}. "
+            "These roles appear in the CV without bullet points."
+        )
+
     # ── Step 3: Cover letter ───────────────────────────────────────────────────
     try:
         with st.spinner("Step 2/2: Writing your cover letter..."):
