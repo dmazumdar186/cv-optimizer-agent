@@ -64,10 +64,10 @@ if st.button("Optimize my CV →", type="primary"):
         st.stop()
 
     try:
-        api_key = st.secrets["GROQ_API_KEY"]
+        api_key = st.secrets["ANTHROPIC_API_KEY"]
     except Exception:
         st.error(
-            "API key not configured. Add GROQ_API_KEY to your Streamlit secrets."
+            "API key not configured. Add ANTHROPIC_API_KEY to your Streamlit secrets."
         )
         st.stop()
 
@@ -91,7 +91,7 @@ if st.button("Optimize my CV →", type="primary"):
         )
         st.stop()
 
-    # ── Step 2: Groq analysis ─────────────────────────────────────────────────
+    # ── Step 2: Claude analysis ───────────────────────────────────────────────────
     try:
         with st.spinner("Step 1/2: Analysing your CV against the job description..."):
             analysis = _call_with_retry(run_analysis, cv_text, jd_text.strip(), api_key)
@@ -99,7 +99,7 @@ if st.button("Optimize my CV →", type="primary"):
         err = str(e)
         if "429" in err or "quota" in err.lower() or "rate" in err.lower():
             st.error(
-                "Groq quota exceeded — free tier limit hit. Please try again later."
+                "API quota exceeded — rate limit hit. Please try again later."
             )
         else:
             st.error("Something went wrong during analysis. Please try again.")
@@ -144,7 +144,7 @@ if st.button("Optimize my CV →", type="primary"):
         err = str(e)
         if "429" in err or "quota" in err.lower() or "rate" in err.lower():
             st.error(
-                "Groq quota exceeded — free tier limit hit. Please try again later."
+                "API quota exceeded — rate limit hit. Please try again later."
             )
         else:
             st.error("Something went wrong generating the cover letter. Please try again.")

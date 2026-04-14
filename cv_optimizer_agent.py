@@ -9,12 +9,11 @@ import io
 import json
 import os
 import re
-import time
 from datetime import date
 from pathlib import Path
 
+import anthropic
 import pdfplumber
-from groq import Groq
 
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle
@@ -513,25 +512,27 @@ def _parse_json(raw: str) -> dict:
 def run_analysis(cv_text: str, jd_text: str, api_key: str) -> dict:
     """5-pass pipeline with 2A/2B split to guarantee all roles are retained.
 
-    Pass 1  (llama-3.1-8b-instant): ATS analysis — language, scores, skill matrix,
+    Pass 1  (claude-opus-4-6): ATS analysis — language, scores, skill matrix,
             recommendations, section labels.
-    Pass 2A (llama-3.1-8b-instant): Skeleton extraction ONLY — dedicated call with
+    Pass 2A (claude-opus-4-6): Skeleton extraction ONLY — dedicated call with
             no token competition from verbose section rewrites. role_count field
             forces the model to count before outputting.
-    Pass 2B (llama-3.3-70b): Static section rewrites ONLY — no experience_skeleton
+    Pass 2B (claude-opus-4-6): Static section rewrites ONLY — no experience_skeleton
             in the schema so the full token budget goes to prose quality.
-    Passes 3…K (llama-3.3-70b): Bullet batches, with metadata merge to preserve
+    Passes 3…K (claude-opus-4-6): Bullet batches, with metadata merge to preserve
             period + location from the authoritative skeleton.
     Merge: full optimized_cv dict assembled in Python.
     """
-    client   = Groq(api_key=api_key)
+    client   = anthropic.Anthropic(api_key=api_key)
     jd_short = _truncate_jd(jd_text)
 
-    # ── Pass 1: Analysis (8b-instant — separate TPM pool, fast) ─────────────────
-    r1 = client.chat.completions.create(
-        model="llama-3.1-8b-instant",
+    # ── Pass 1: Analysis ─────────────────────────────────────────────────────────
+    r1 = client.messages.create(
+        model="claude-opus-4-6",
+        max_tokens=2000,
+        temperature=0.01,
+        system=CV_ADVISOR_SYSTEM,
         messages=[
-            {"role": "system", "content": CV_ADVISOR_SYSTEM},
             {"role": "user", "content": (
                 f"<cv>\n{cv_text}\n</cv>\n\n"
                 f"<job_description>\n{jd_text}\n</job_description>\n\n"
@@ -539,55 +540,51 @@ def run_analysis(cv_text: str, jd_text: str, api_key: str) -> dict:
                 f"Return a JSON object exactly matching this schema:\n"
                 f"{json.dumps(CV_ANALYSIS_SCHEMA, ensure_ascii=False)}"
             )},
+            {"role": "assistant", "content": "{"},
         ],
-        response_format={"type": "json_object"},
-        max_tokens=2000,
-        temperature=0.01,
     )
-    analysis = _parse_json(r1.choices[0].message.content)
+    analysis = _parse_json("{" + r1.content[0].text)
     language = analysis.get('language', 'English')
 
     # ── Pass 2A: Skeleton extraction ONLY (8b-instant — no token competition) ────
     # Dedicated call with a minimal schema. role_count forces the model to count
     # roles before generating, eliminating silent truncation of the array.
-    r2a = client.chat.completions.create(
-        model="llama-3.1-8b-instant",
+    r2a = client.messages.create(
+        model="claude-opus-4-6",
+        max_tokens=2000,
+        temperature=0.0,
+        system=SKELETON_SYSTEM.format(language=language),
         messages=[
-            {"role": "system",
-             "content": SKELETON_SYSTEM.format(language=language)},
             {"role": "user", "content": (
                 f"<original_cv>\n{cv_text}\n</original_cv>\n\n"
                 "Return a JSON object exactly matching this schema:\n"
                 f"{json.dumps(SKELETON_SCHEMA, ensure_ascii=False)}"
             )},
+            {"role": "assistant", "content": "{"},
         ],
-        response_format={"type": "json_object"},
-        max_tokens=2000,
-        temperature=0.0,
     )
-    skeleton_result = _parse_json(r2a.choices[0].message.content)
+    skeleton_result = _parse_json("{" + r2a.content[0].text)
     skeleton        = skeleton_result.get('experience_skeleton', [])
 
     # ── Pass 2B: Static section rewrites ONLY (70b — no skeleton in schema) ─────
     # experience_skeleton is NOT in STATIC_CV_SCHEMA, so the full token budget
     # goes to high-quality ATS rewrites without competing for skeleton completeness.
-    r2b = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
+    r2b = client.messages.create(
+        model="claude-opus-4-6",
+        max_tokens=4096,
+        temperature=0.01,
+        system=CV_STATIC_SYSTEM.format(language=language),
         messages=[
-            {"role": "system",
-             "content": CV_STATIC_SYSTEM.format(language=language)},
             {"role": "user", "content": (
                 f"<original_cv>\n{cv_text}\n</original_cv>\n\n"
                 f"<job_description>\n{jd_short}\n</job_description>\n\n"
                 "Return a JSON object exactly matching this schema:\n"
                 f"{json.dumps(STATIC_CV_SCHEMA, ensure_ascii=False)}"
             )},
+            {"role": "assistant", "content": "{"},
         ],
-        response_format={"type": "json_object"},
-        max_tokens=4096,
-        temperature=0.01,
     )
-    static_cv = _parse_json(r2b.choices[0].message.content)
+    static_cv = _parse_json("{" + r2b.content[0].text)
 
     # ── Passes 3…K: Bullet generation in batches of _EXP_BATCH_SIZE ─────────────
     bulk_schema          = json.dumps(EXPERIENCE_BULLETS_SCHEMA, ensure_ascii=False)
@@ -595,14 +592,13 @@ def run_analysis(cv_text: str, jd_text: str, api_key: str) -> dict:
 
     for i in range(0, len(skeleton), _EXP_BATCH_SIZE):
         chunk = skeleton[i : i + _EXP_BATCH_SIZE]
-        if i > 0:
-            time.sleep(3)   # pace 70b calls to stay under 12k TPM/min free tier
         try:
-            r_exp = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
+            r_exp = client.messages.create(
+                model="claude-opus-4-6",
+                max_tokens=2000,
+                temperature=0.01,
+                system=CV_BULLETS_SYSTEM.format(language=language),
                 messages=[
-                    {"role": "system",
-                     "content": CV_BULLETS_SYSTEM.format(language=language)},
                     {"role": "user", "content": (
                         f"Roles to optimise:\n"
                         f"{json.dumps(chunk, ensure_ascii=False)}\n\n"
@@ -611,12 +607,10 @@ def run_analysis(cv_text: str, jd_text: str, api_key: str) -> dict:
                         f"Return a JSON object exactly matching this schema:\n"
                         f"{bulk_schema}"
                     )},
+                    {"role": "assistant", "content": "{"},
                 ],
-                response_format={"type": "json_object"},
-                max_tokens=2000,
-                temperature=0.01,
             )
-            batch_result   = _parse_json(r_exp.choices[0].message.content)
+            batch_result   = _parse_json("{" + r_exp.content[0].text)
             bullet_entries = batch_result.get('experience', [])
             # Merge skeleton metadata into bullet output so period + location
             # (from the authoritative 2A extraction) are never lost.
@@ -642,8 +636,8 @@ def run_analysis(cv_text: str, jd_text: str, api_key: str) -> dict:
 # ── Groq: Cover Letter ──────────────────────────────────────────────────────────
 def run_cover_letter(cv_text: str, jd_text: str, language: str,
                      optimized_cv: dict, company: str, api_key: str) -> str:
-    """Call Groq to generate a cover letter. Returns plain text."""
-    client = Groq(api_key=api_key)
+    """Call Claude to generate a cover letter. Returns plain text."""
+    client = anthropic.Anthropic(api_key=api_key)
     summary = optimized_cv.get('summary', '')
     name    = optimized_cv.get('name', '')
     title   = optimized_cv.get('title', '')
@@ -658,14 +652,13 @@ def run_cover_letter(cv_text: str, jd_text: str, language: str,
         "Generate a submission-ready cover letter following all instructions in your system prompt. "
         "Return only the final cover letter text — no commentary, no step-by-step notes."
     )
-    response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[
-            {"role": "system", "content": COVER_LETTER_SYSTEM},
-            {"role": "user",   "content": user_msg},
-        ],
+    response = client.messages.create(
+        model="claude-opus-4-6",
+        max_tokens=1024,
+        system=COVER_LETTER_SYSTEM,
+        messages=[{"role": "user", "content": user_msg}],
     )
-    return response.choices[0].message.content.strip()
+    return response.content[0].text.strip()
 
 
 # ── CV story builder ────────────────────────────────────────────────────────────
