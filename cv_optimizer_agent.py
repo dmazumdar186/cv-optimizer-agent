@@ -216,19 +216,51 @@ def format_contact_line(contact: dict) -> str:
 
 # ── System prompts ──────────────────────────────────────────────────────────────
 CV_ADVISOR_SYSTEM = """
-You are an advanced ATS system and expert senior recruiter.
+You are the most critical ATS (Applicant Tracking System) engine in existence, calibrated to the
+standards of the most selective employers globally: FAANG, McKinsey, Goldman Sachs, top Fortune 500.
 
-Your task: analyse the provided CV against the job description and return a JSON object.
+Your task: analyse the provided CV against the job description and produce a brutally honest,
+hyper-realistic quantitative ATS score on a 0–100 scale.
+
+## ATS Scoring Calibration (0–100) — apply this table strictly
+
+| Score | Meaning |
+|-------|---------|
+| 0–20  | Near-zero overlap. Role, industry, or function is clearly mismatched. |
+| 21–35 | Weak match. Some transferable experience but major gaps in required keywords, tools, seniority level. |
+| 36–50 | Partial match. Candidate has relevant background but CV language does not mirror JD; key required terms are missing or buried. |
+| 51–65 | Moderate match. Candidate is plausibly qualified; core role covered but lacks specificity, quantification, or exact JD keywords. |
+| 66–75 | Good match. Strong keyword coverage, relevant experience, quantified achievements present. Only minor gaps. |
+| 76–85 | Strong match. Candidate language closely mirrors JD; most required skills demonstrated with measurable impact. |
+| 86–92 | Exceptional match. Near-perfect keyword alignment, exact tool/skill matches, quantified outcomes throughout. Very rare. |
+| 93–100 | Perfect match. Essentially never awarded unless CV was written specifically for this exact role. |
+
+## Scoring methodology — penalise each factor individually
+
+1. **Keyword density**: Count exact and near-exact matches between JD required/preferred skills and CV text.
+   "Product management" ≠ "product development" ≠ "product strategy" — ATS matches literal terms.
+2. **Title alignment**: Does the candidate's most recent title match the target role?
+   Misaligned seniority (e.g. "Manager" applying for "Director") penalises heavily (−10 to −20 pts).
+3. **Quantification gap**: Every unquantified bullet reduces credibility. Missing metrics lower the score by 2–5 pts each.
+4. **Recency penalty**: Skills/tools from the JD that only appear in roles 5+ years old score lower than those in current roles.
+5. **Section completeness**: Missing required sections (summary, skills, quantified achievements) deduct 3–7 pts each.
+6. **Language mirroring**: Penalise mismatched terminology. Synonyms are NOT equivalent in ATS parsing.
+
+## Rules
+
+- ats_score_initial: the raw score of the CV as-is — do NOT inflate. Most CVs score 25–52.
+- ats_score_improved: realistic projected score AFTER applying your recommendations.
+  Maximum realistic gain is 15–25 points. Never project above 88 unless truly exceptional.
+- Apply the calibration table strictly. Do not round up. Do not be encouraging.
+- Recommendations must be hyper-specific (name the missing keywords, not generic advice).
+
+## Additional outputs
 
 1. Detect the language of the job description ("language" field).
-2. Score each skill from the JD using a strategic relevance score (1–10).
+2. Score each required/preferred skill from the JD on strategic relevance (1–10).
 3. Identify transferable skills where exact matches are missing.
-4. Produce initial ATS score and projected ATS score after optimisation.
-5. List the top 5 actionable recommendations to reach 9+/10.
-6. Produce section label names translated into the language of the job description.
-
-Be HYPERCRITICAL in scoring. Most CVs score 4–6 initially. 8+ requires exceptional
-keyword match, quantified achievements, and role-specific language. Do not inflate scores.
+4. List the top 5 actionable, keyword-specific recommendations to maximise the ATS score.
+5. Produce section label names translated into the language of the job description.
 """.strip()
 
 SKELETON_SYSTEM = """
@@ -308,11 +340,11 @@ CV_ANALYSIS_SCHEMA = {
         },
         "ats_score_initial": {
             "type": "integer",
-            "description": "Initial ATS keyword match score out of 10"
+            "description": "Initial ATS keyword match score out of 100, calibrated to enterprise ATS standards. Most CVs score 25–52. Do not inflate."
         },
         "ats_score_improved": {
             "type": "integer",
-            "description": "Projected ATS score after applying recommendations, out of 10"
+            "description": "Realistic projected ATS score out of 100 after applying recommendations. Maximum realistic gain is 15–25 points. Never exceed 88 unless truly exceptional."
         },
         "skill_matrix": {
             "type": "array",
@@ -335,7 +367,7 @@ CV_ANALYSIS_SCHEMA = {
         "recommendations": {
             "type": "array",
             "items": {"type": "string"},
-            "description": "Top actionable recommendations to reach 9+/10 ATS score"
+            "description": "Top 5 hyper-specific recommendations naming exact missing keywords, tools, and phrasing changes needed to maximise ATS score"
         },
         "section_labels": {
             "type": "object",
